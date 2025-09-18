@@ -4,6 +4,7 @@ baselines/WildlifeReID-10k/features*/
 baselines/WildlifeReID-10k/results*/
 baselines/WildlifeReID-10k/clusters*/
 venv*/
+.venv/
 
 .vscode/
 __pycache__/
@@ -22,3 +23,8 @@ site/
 token.txt
 *.egg-info
 dist/
+
+wandb/
+checkpoints/
+*.pt
+*.pth
