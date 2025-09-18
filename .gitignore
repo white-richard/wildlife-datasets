@@ -28,3 +28,4 @@ wandb/
 checkpoints/
 *.pt
 *.pth
+tmp/
