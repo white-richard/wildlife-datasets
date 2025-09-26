@@ -5,6 +5,7 @@ baselines/WildlifeReID-10k/results*/
 baselines/WildlifeReID-10k/clusters*/
 venv*/
 .venv/
+author_close/
 
 .vscode/
 __pycache__/
