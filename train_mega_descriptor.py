@@ -15,11 +15,9 @@ import numpy as np
 from timm.scheduler import CosineLRScheduler
 import torch.nn.init as init
 
-from wildlife_tools.train import ArcFaceLoss
+from wildlife_tools.train.objective import ArcFaceLoss
 from wildlife_datasets.datasets import WildlifeReID10k
 from wildlife_datasets import splits
-from wildlife_tools.data import FeatureDatabase
-from wildlife_tools.inference import KnnMatcher
 
 from geoopt import ManifoldParameter
 import hypercore.nn as hnn
@@ -31,153 +29,32 @@ from hypercore.modules.loss import LorentzTripletLoss
 
 from eucTohyp_Swin import replace_stages_with_hyperbolic
 from wr10k_dataset import WR10kDataset
+from knn_per_class import evaluate_knn1
 
 torch.backends.cudnn.benchmark = True
-
-
-def set_seed(seed:int):
+def set_seed(seed=0, device='cuda'):
+    os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device == 'cuda':
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def set_seed(seed:int):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     # cuDNN / cuBLAS determinism
     torch.use_deterministic_algorithms(True, warn_only=True) # will raise if you hit a non-deterministic op
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     # For cuBLAS deterministic reductions
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # or ":16:8"
-
-
-@torch.no_grad()
-def build_feature_database_for_refds(
-    model,
-    ref_ds,
-    ref_loader: DataLoader,
-    out_path: str = "ref_database.pkl",
-    device: str = "cuda",
-    l2_normalize: bool = True,
-):
-    """
-    Writes a FeatureDatabase-compatible pickle with keys:
-      - features:  float32 (N, D)
-      - metadata:  pandas.DataFrame with column 'identity'
-      - col_label: string (default 'identity')
-      - load_label: bool
-    """
-    import pandas as pd
-    model.eval().to(device)
-    assert hasattr(ref_ds, "id2idx"), "ref_ds must have an 'id2idx' mapping"
-
-    idx2id = {v: k for k, v in ref_ds.id2idx.items()}
-
-    embs, ids = [], []
-    for xb, yb, *_ in tqdm(ref_loader, total=len(ref_loader), desc="Building reference DB"):
-        xb = xb.to(device, non_blocking=True)
-        zb = model(xb)
-        if l2_normalize:
-            zb = torch.nn.functional.normalize(zb, dim=1)
-        embs.append(zb.detach().cpu().to(torch.float32).numpy())
-        ids.extend([idx2id[int(y)] for y in yb])
-
-    features = np.concatenate(embs, axis=0).astype(np.float32)
-    metadata = pd.DataFrame({"identity": np.array(ids, dtype=object)})
-
-    with open(out_path, "wb") as f:
-        pickle.dump(
-            {
-                "features": features,
-                "metadata": metadata,
-                "col_label": "identity",
-                "load_label": True,
-            },
-            f,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-    return out_path
-
-
-@torch.inference_mode()
-def evaluate_per_dataset_with_knnmatcher(
-    model,
-    ref_ds,
-    qry_loader,
-    database_file: str = "ref_database.pkl",
-    device: str = "cuda",
-    dataset_col: str = "dataset",
-    force_rebuild: bool = False,
-):
-    """
-    Evaluates 1-NN top-1 per-dataset accuracy using a FeatureDatabase loaded from .pkl.
-    If database_file does not exist (or force_rebuild=True), it will be built first.
-    """
-    assert hasattr(ref_ds, 'id2idx'), "ref_ds must have an 'id2idx' mapping"
-    assert hasattr(ref_ds, 'df'), "ref_ds must have a 'df' DataFrame"
-    assert dataset_col in ref_ds.df.columns, (
-        f"'{dataset_col}' not in df columns: {list(ref_ds.df.columns)}"
-    )
-    ref_loader = DataLoader(ref_ds, batch_size=64, shuffle=False, num_workers=8, pin_memory=True)
-
-    model.eval().to(device)
-
-    idx2id = {v: k for k, v in ref_ds.id2idx.items()}  # int label -> str identity
-    
-    # Fix: Build id2dataset from both reference AND query datasets
-    ref_id2dataset = (
-        ref_ds.df.drop_duplicates('identity')
-        .set_index('identity')[dataset_col]
-        .to_dict()
-    )
-    
-    # Get the query dataset's dataframe to build complete mapping
-    qry_ds = qry_loader.dataset
-    if hasattr(qry_ds, 'df'):
-        qry_id2dataset = (
-            qry_ds.df.drop_duplicates('identity')
-            .set_index('identity')[dataset_col]
-            .to_dict()
-        )
-        # Combine both mappings
-        id2dataset = {**ref_id2dataset, **qry_id2dataset}
-    else:
-        id2dataset = ref_id2dataset
-
-    if force_rebuild or not os.path.exists(database_file):
-        build_feature_database_for_refds(
-            model=model,
-            ref_ds=ref_ds,
-            ref_loader=ref_loader,
-            out_path=database_file,
-            device=device,
-            l2_normalize=True,
-        )
-
-    database = FeatureDatabase.from_file(database_file)
-    matcher = KnnMatcher(database, k=1)
-
-    Q_batches = [] # collect (B, D) arrays
-    true_ids = []
-    for xb, yb, *_ in tqdm(qry_loader, total=len(qry_loader), desc="Embedding queries"):
-        xb = xb.to(device, non_blocking=True)
-        zb = torch.nn.functional.normalize(model(xb), dim=1)  # (B, D)
-        Q_batches.append(zb.detach().cpu().to(torch.float32).numpy())  # (B, D)
-        true_ids.extend([idx2id[int(y)] for y in yb])
-
-    Q = np.vstack(Q_batches) # (N, D)
-    pred_ids = matcher(Q)
-
-    per_dataset_acc = defaultdict(list)
-    for t_id, p_id in zip(true_ids, pred_ids):
-        # Fix: Handle missing identities gracefully
-        if t_id not in id2dataset:
-            print(f"Warning: Identity '{t_id}' not found in dataset mapping, skipping...")
-            continue
-            
-        ds_name = id2dataset[t_id]
-        per_dataset_acc[ds_name].append(p_id == t_id)
-
-    per_dataset_acc = {ds: float(np.mean(v)) for ds, v in per_dataset_acc.items()}
-    overall = float(np.mean(list(per_dataset_acc.values()))) if per_dataset_acc else float('nan')
-    return overall, per_dataset_acc
 
 
 def train_one_epoch(
@@ -505,6 +382,7 @@ def main():
     # sampler = PKSampler(train_labels, P=P, K=K)
     # train_loader = DataLoader(train_set, batch_sampler=sampler, num_workers=8, pin_memory=True)
     train_loader = DataLoader(train_set, batch_size=128, num_workers=16, pin_memory=True, drop_last=False, shuffle=True)
+    ref_eval_set_loader = DataLoader(ref_eval_set, batch_size=64, shuffle=False, num_workers=16, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=16, pin_memory=True)
 
     if model_name == 'hyp_swin':
@@ -642,7 +520,7 @@ def main():
         warnings.warn("USING TANGENT HEAD FOR EVALUATION")
 
     # Per dataset accuracy and wandb logging
-    overall, per_dataset_acc = evaluate_per_dataset_with_knnmatcher(backbone, ref_eval_set, val_loader, device=device, dataset_col='dataset', force_rebuild=True)
+    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device, dataset_col='dataset', force_rebuild=True)
     if use_wandb:
         wandb.log({"metrics/overall_acc": overall})
         for ds, acc in per_dataset_acc.items():
