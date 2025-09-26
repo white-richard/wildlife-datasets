@@ -1,0 +1,7 @@
+wildlife-tools
+torch
+torchvision
+numpy
+timm
+tqdm
+wandb

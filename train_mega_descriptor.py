@@ -419,7 +419,7 @@ def debug_data_splits(train_set, val_set, ref_eval_set):
         
 
 def main():
-    use_wandb = True
+    use_wandb = False
     hyperbolic = True
     checkpoint_path = None
     P, K = 32, 4
@@ -462,7 +462,7 @@ def main():
     ])
 
 
-    root = "/home/richw/.richie/repos/wildlifereid-10k"
+    root = "/home/richw/.code/wildlifereid-10k"
     meta = WildlifeReID10k(root)
     df = meta.df
     splitter = splits.ClosedSetSplit(ratio_train=0.8, col_label="identity") # keep IDs same in train/test
