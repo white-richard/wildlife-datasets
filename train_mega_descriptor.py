@@ -520,7 +520,7 @@ def main():
         warnings.warn("USING TANGENT HEAD FOR EVALUATION")
 
     # Per dataset accuracy and wandb logging
-    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device, dataset_col='dataset', force_rebuild=True)
+    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device)
     if use_wandb:
         wandb.log({"metrics/overall_acc": overall})
         for ds, acc in per_dataset_acc.items():
@@ -535,7 +535,7 @@ def main():
         })
         wandb.finish()
     else:
-        print(f"Overall acc: {overall}.See plot for per dataset acc.")
+        print(f"Overall acc: {overall}.")
 
 if __name__ == '__main__':
     main()
