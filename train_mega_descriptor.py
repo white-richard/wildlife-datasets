@@ -1,17 +1,39 @@
+"""
+Modular WR10k trainer with clean structure and flexible Weights & Biases (W&B) usage.
+
+Supports three modes:
+  - --wandb off      : no W&B imports or logging (safe to run without wandb installed)
+  - --wandb online   : standard wandb.init / wandb.log run
+  - --wandb sweep    : sweep-friendly; hyperparams are pulled from wandb.config if present
+
+Training paradigms are pluggable via a simple Strategy registry (see `TrainingParadigm`).
+You can add new paradigms without touching the main training loop.
+
+This file keeps your original custom dependencies but isolates them behind builders.
+"""
+from __future__ import annotations
 import os
+import sys
+import json
+import math
 import random
+import argparse
+from dataclasses import dataclass, asdict
+from enum import Enum
+from typing import Optional, Tuple, Dict, Any, Iterable, List
+
+import numpy as np
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch import amp
+import torch.nn.init as init
 import torchvision.transforms as T
 import timm
-from tqdm import tqdm, trange
-import wandb
-import numpy as np
 from timm.scheduler import CosineLRScheduler
-import torch.nn.init as init
+from tqdm import tqdm, trange
+import wandb as _wandb
 
 from wildlife_tools.train.objective import ArcFaceLoss
 from wildlife_datasets.datasets import WildlifeReID10k
@@ -22,195 +44,93 @@ import hypercore.nn as hnn
 from hypercore.utils.manifold_utils import lock_curvature_to_one
 from hypercore.models.Swin_LViT import LSwin_small
 from hypercore.manifolds.lorentzian import Lorentz
-from hypercore.optimizers import RiemannianSGD
+from hypercore.optimizers import RiemannianSGD, RiemannianAdam
 from hypercore.modules.loss import LorentzTripletLoss
 
 from eucTohyp_Swin import replace_stages_with_hyperbolic
 from wr10k_dataset import WR10kDataset
 from knn_per_class import evaluate_knn1
+from wandb_session import WandbSession, WandbMode
 
 torch.backends.cudnn.benchmark = True
-def set_seed(seed=0, device='cuda'):
+
+
+def set_seed(seed: int = 0) -> None:
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if device == 'cuda':
+    if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-def set_seed(seed:int):
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # cuDNN / cuBLAS determinism
-    torch.use_deterministic_algorithms(True, warn_only=True) # will raise if you hit a non-deterministic op
+    torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # For cuBLAS deterministic reductions
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # or ":16:8"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
-def train_one_epoch(
-    model,
-    head,
-    loader,
-    optimizer,
-    epoch,
-    scaler=None,
-    accumulation_steps=1,
-    device="cuda",
-    use_amp=False,
-):
-    model.train()
-    head.train()
+@dataclass
+class Config:
+    # run meta
+    run_name: str = "wr10k_megadesc_arcface"
+    seed: int = 42
+    save_dir: str = "checkpoints"
 
-    steps_per_epoch = len(loader)
-    running_loss = 0.0
-    optimizer.zero_grad(set_to_none=True)
+    # data
+    root: str = "/home/richw/.code/wildlifereid-10k"
+    img_size: int = 224
+    num_workers: int = 16
+    train_batch: int = 128
+    eval_batch: int = 128
 
-    iteration = 0
+    # model / paradigm
+    model_name: str = "megadesc_replace_last_layer_hyperbolic"  # choices below
+    loss_type: str = "triplet"  # arcface | triplet
+    hyperbolic: bool = True
 
-    pbar = tqdm(enumerate(loader), total=steps_per_epoch, leave=False)
+    # optimization
+    epochs: int = 40
+    lr: float = 1e-3
+    wd: float = 1e-4
+    momentum: float = 0.9
+    warmup_t: int = 5
+    lr_min: float = 1e-6
+    optimizer_name: str = "sgd"  # sgd | adam
 
-    for micro_step, batch in pbar:
-        x = batch[0].to(device, non_blocking=True)
-        y = batch[1].to(device, non_blocking=True)
+    # training loop
+    accumulation_steps: int = 1
+    use_amp: bool = False
+    val_interval: int = 1
+    patience: int = 15
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            feats = model(x)
-            loss = head(feats, y) / accumulation_steps
-        
-        if use_amp:
-            feats = feats.float()
-     
-        scaler.scale(loss).backward()
-        running_loss += loss.detach()
-
-        if (micro_step + 1) % accumulation_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            iteration += 1
-        pbar.set_description(f"epoch {epoch} | loss {running_loss/(micro_step+1):.4f}")
-    return running_loss / steps_per_epoch
+    # logging
+    wandb_mode: WandbMode = WandbMode.OFF
+    project: str = "reproduce_mega_descriptor"
 
 
-def train(
-    epochs,
-    backbone,
-    objective,
-    train_loader,
-    val_loader,
-    optimizer,
-    scheduler,
-    ref_eval_set,
-    seed,
-    use_wandb,
-    use_amp,
-    scaler=None,
-    accumulation_steps=1,
-    val_interval=5,  # Validate every 5 epochs instead of every step
-    patience=3,      # Reduce patience since validation is less frequent  
-    device='cuda',
-    save_dir='checkpoints',
-    run_name='wr10k_megadesc_arcface',
-    embed_dim=128,
-    num_classes=1000,
-):
-    os.makedirs(save_dir, exist_ok=True)
+# ------------------------------------------------------------------------------------------------
+# Helper modules & builders
+# ------------------------------------------------------------------------------------------------
+class LorentzEmbToTangent(nn.Module):
+    def __init__(self, manifold):
+        super().__init__()
+        self.manifold = manifold
 
-    # best_acc = -float('inf')
-    best_loss = -float('inf')
-
-    best_epoch = -1
-    no_improve_evals = 0
-    
-    # Create validation subsets for faster evaluation during training
-    # ref_subset_size = min(len(ref_eval_set), 2000)  # Limit reference set size
-    # val_subset_size = min(len(val_loader.dataset), 1000)  # Limit query set size
-    
-    # ref_indices = torch.randperm(len(ref_eval_set))[:ref_subset_size]
-    # val_indices = torch.randperm(len(val_loader.dataset))[:val_subset_size]
-    
-    # Fix: Create a new dataset instance instead of Subset to preserve attributes
-    # ref_subset_df = ref_eval_set.df.iloc[ref_indices.numpy()].reset_index(drop=True)
-    # val_subset_df = val_loader.dataset.df.iloc[val_indices.numpy()].reset_index(drop=True)
-    
-    # Create new dataset instances with the same transforms and id_list
-    # ref_subset = WR10kDataset(ref_subset_df, ref_eval_set.root, ref_eval_set.transform, 
-    #                          id_list=ref_eval_set.id_list)
-    # val_subset = WR10kDataset(val_subset_df, val_loader.dataset.root, val_loader.dataset.transform,
-                            #  id_list=val_loader.dataset.id_list)
-    
-    # val_subset_loader = DataLoader(val_subset, batch_size=64, shuffle=False, num_workers=8)
-
-    for epoch in trange(1, epochs + 1, desc="Epochs"):
-        train_loss = train_one_epoch(
-            backbone, objective, train_loader, optimizer, epoch,
-            scaler=scaler, accumulation_steps=accumulation_steps, 
-            device=device, use_amp=use_amp,
-        )
-        scheduler.step(epoch + 1)
-
-        # Periodic validation using actual retrieval metric
-        if epoch % val_interval == 0 or epoch == epochs:
-
-           
-            if train_loss < best_loss:
-                best_loss = train_loss
-                best_epoch = epoch
-                no_improve_evals = 0
-                torch.save({
-                    'epoch': epoch,
-                    'model': backbone.state_dict(),
-                    'head': objective.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'seed': seed,
-                    'best_loss': best_loss,
-                }, os.path.join(save_dir, f'{run_name}_best_epoch{epoch}.pt'))
-                print(f"[VAL] New best @ epoch {epoch}: loss={best_loss:.4f} (saved)")
-            else:
-                no_improve_evals += 1
-                print(f"[VAL] train_loss={train_loss:.4f} (best={best_loss:.4f} @ {best_epoch}) "
-                      f"| patience {no_improve_evals}/{patience}")
-
-            if use_wandb:
-                wandb.log({
-                    "val/train_loss": train_loss,
-                    "val/best_loss": best_loss,
-                    "epoch": epoch,
-                    "train_loss": float(train_loss)
-                })
-
-            if no_improve_evals >= patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                break
-
-    final_ckpt = {
-        'epoch': epoch,
-        'model': backbone.state_dict(),
-        'head': objective.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'seed': seed,
-        'best_loss': best_loss,
-        'best_epoch': best_epoch,
-    }
-    torch.save(final_ckpt, os.path.join(save_dir, f'{run_name}_final.pt'))
-    print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
+    def forward(self, x):
+        v = self.manifold.logmap0(x)
+        return v[..., 1:]
 
 
-def split_decay_groups(model: nn.Module):
-    """Return (decay, no_decay) parameter lists for a model.
-    - no_decay: LayerNorm weights & biases, plus all biases
-    - decay: everything else
-    """
+def init_weights_xavier(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            init.zeros_(m.bias)
+    elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
+        init.ones_(m.weight)
+        init.zeros_(m.bias)
+
+
+def split_decay_groups(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
     ln_param_names = set()
     for mod_name, mod in model.named_modules():
         if isinstance(mod, (nn.LayerNorm, hnn.LorentzLayerNorm)):
@@ -228,312 +148,482 @@ def split_decay_groups(model: nn.Module):
             decay.append(p)
     return decay, no_decay
 
-def remove_curvature_from_optimizer(optimizer, manifold):
-    # Collect the actual Parameter objects we want to remove
+
+def remove_curvature_from_optimizer(optimizer, manifold) -> None:
     params_to_remove = []
     for attr in ("k", "c"):
         if hasattr(manifold, attr):
             val = getattr(manifold, attr)
             if isinstance(val, torch.nn.Parameter):
                 params_to_remove.append(val)
-
     if not params_to_remove:
         return
-
     remove_ids = {id(p) for p in params_to_remove}
-
-    # Remove from param groups (compare by identity via id())
     for group in optimizer.param_groups:
         group["params"] = [p for p in group["params"] if id(p) not in remove_ids]
-
-    # Also drop any optimizer state tied to those params
     for p in list(optimizer.state.keys()):
         if id(p) in remove_ids:
-            print(p)
             optimizer.state.pop(p, None)
-            print(f"Dropped {p} from optimizer to disable gradients.")
-
-def init_weights_xavier(m):
-    if isinstance(m, (nn.Linear, nn.Conv2d)):
-        init.xavier_uniform_(m.weight) # or xavier_normal_
-        if m.bias is not None:
-            init.zeros_(m.bias)
-    elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
-        init.ones_(m.weight)
-        init.zeros_(m.bias)
+            print(f"Dropped curvature param {p} from optimizer.")
 
 
-class LorentzEmbToTangent(nn.Module):
-    def __init__(self, manifold):
-        super().__init__()
-        self.manifold = manifold
+# ------------------------------------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------------------------------------
+class DataBuilder:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-    def forward(self, x):
-        v = self.manifold.logmap0(x)
-        v = v[..., 1:]
-        return v
+    def _train_tfms(self) -> T.Compose:
+        d = self.cfg.img_size
+        return T.Compose([
+            T.RandomResizedCrop(size=d, scale=(0.7, 1.0), interpolation=T.InterpolationMode.BICUBIC),
+            T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
+            T.RandomGrayscale(p=0.10),
+            T.RandomApply([T.GaussianBlur(kernel_size=9, sigma=(0.1, 1.5))], p=0.2),
+            T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
+            T.ToTensor(),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
+        ])
+
+    def _eval_tfms(self) -> T.Compose:
+        d = self.cfg.img_size
+        return T.Compose([
+            T.Resize(int(d / 0.875), interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(d),
+            T.ToTensor(),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+
+    def build(self):
+        meta = WildlifeReID10k(self.cfg.root)
+        df = meta.df
+        splitter = splits.ClosedSetSplit(ratio_train=0.8, col_label="identity")
+        idx_ref, idx_qry = splitter.split(df)[0]
+        df_ref = df.iloc[idx_ref].copy()
+        df_qry = df.iloc[idx_qry].copy()
+
+        # Enforce identical identity sets across splits (closed-set)
+        train_ids = set(df_ref['identity'].unique())
+        val_ids = set(df_qry['identity'].unique())
+        if train_ids != val_ids:
+            common = train_ids & val_ids
+            df_ref = df_ref[df_ref['identity'].isin(common)].copy()
+            df_qry = df_qry[df_qry['identity'].isin(common)].copy()
+
+        train_set = WR10kDataset(df_ref, self.cfg.root, self._train_tfms())
+        id_list = sorted(train_set.id2idx.keys())
+        ref_eval_set = WR10kDataset(df_ref, self.cfg.root, self._eval_tfms(), id_list=id_list)
+        val_set = WR10kDataset(df_qry, self.cfg.root, self._eval_tfms(), id_list=id_list)
+
+        train_loader = DataLoader(
+            train_set,
+            batch_size=self.cfg.train_batch,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            shuffle=True,
+        )
+        ref_eval_set_loader = DataLoader(ref_eval_set, batch_size=self.cfg.eval_batch, shuffle=False,
+                                         num_workers=self.cfg.num_workers, pin_memory=True)
+        val_loader = DataLoader(val_set, batch_size=self.cfg.eval_batch, shuffle=False,
+                                num_workers=self.cfg.num_workers, pin_memory=True)
+
+        return train_set, ref_eval_set, val_set, train_loader, ref_eval_set_loader, val_loader
 
 
-def debug_data_splits(train_set, val_set, ref_eval_set):
-    """Debug the train/val split to ensure no data leakage"""
-    train_ids = set(train_set.df['identity'].unique())
-    val_ids = set(val_set.df['identity'].unique()) 
-    ref_ids = set(ref_eval_set.df['identity'].unique())
-    
-    print(f"Train unique IDs: {len(train_ids)}")
-    print(f"Val unique IDs: {len(val_ids)}")  
-    print(f"Ref unique IDs: {len(ref_ids)}")
-    print(f"Train/Val overlap: {len(train_ids & val_ids)}")
-    print(f"Train/Ref overlap: {len(train_ids & ref_ids)}")
-    
-    # Check if same identity appears in both splits (should be 100% for closed set)
-    if train_ids == val_ids == ref_ids:
-        print("✓ Closed set split correct - all identities in train/val/ref")
+# ------------------------------------------------------------------------------------------------
+# Model/Objective/Optim builders
+# ------------------------------------------------------------------------------------------------
+class ModelBuilder:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def build(self):
+        model_name = self.cfg.model_name
+        manifold = None
+        emb_dim = None
+
+        if model_name == 'hyp_swin':
+            manifold = Lorentz()
+            lock_curvature_to_one(manifold)
+            backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32+1)
+            for p in backbone.parameters():
+                if isinstance(p, ManifoldParameter):
+                    p.requires_grad_(False)
+            emb_dim = backbone.width - 1
+            backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
+
+        elif model_name == 'megadescriptor_swin':
+            backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=False)
+            emb_dim = backbone.num_features
+            backbone.apply(init_weights_xavier)
+
+        elif model_name == 'megadescriptor_swin_pretrained':
+            backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=True)
+            emb_dim = backbone.num_features
+
+        elif model_name == 'megadesc_replace_last_layer_hyperbolic':
+            backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=True)
+            backbone, hyp_stages = replace_stages_with_hyperbolic(backbone, num_stages=1)
+            if hasattr(backbone, "norm"):
+                backbone.norm = nn.Identity()
+            if hasattr(backbone, "global_pool"):
+                backbone.global_pool = ""
+            backbone.reset_classifier(num_classes=0, global_pool='')
+            # freeze original weights & unfreeze inserted hyp blocks
+            for n, p in backbone.named_parameters():
+                p.requires_grad = False
+            for hyp_stage in hyp_stages:
+                for p in hyp_stage.parameters():
+                    p.requires_grad = True
+            emb_dim = 1025
+            manifold = hyp_stages[-1].manifold
+
+        else:
+            raise ValueError(f"Unknown model_name {model_name}")
+
+        return backbone, emb_dim, manifold
+
+class ObjectiveBuilder:
+    @staticmethod
+    def build(loss_type: str, num_classes: int, emb_dim: int, hyperbolic: bool, manifold=None):
+        if loss_type == 'arcface':
+            return ArcFaceLoss(num_classes=num_classes, embedding_size=emb_dim, margin=0.5, scale=64)
+        if loss_type == 'triplet':
+            if hyperbolic:
+                return LorentzTripletLoss(manifold, margin=0.2, type_of_triplets='hard', feature_dim=emb_dim)
+            return nn.TripletMarginLoss(margin=0.2, p=2)
+        raise ValueError(f"Unknown loss_type {loss_type}")
+
+
+class OptimBuilder:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def build(self, backbone: nn.Module, head: nn.Module, manifold=None):
+        wd = self.cfg.wd
+        decay, no_decay = split_decay_groups(backbone)
+        head_params = [p for p in head.parameters() if p.requires_grad]
+
+        if self.cfg.hyperbolic:
+            if self.cfg.optimizer_name == "adam":
+                optimizer = RiemannianAdam([
+                    {"params": decay,    "weight_decay": wd},
+                    {"params": no_decay, "weight_decay": 0.0},
+                ], lr=self.cfg.lr, stabilize=1)
+                if self.cfg.loss_type != 'triplet':
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+                if manifold is not None:
+                    remove_curvature_from_optimizer(optimizer, manifold)
+            else:
+                optimizer = RiemannianSGD([
+                    {"params": decay,    "weight_decay": wd},
+                    {"params": no_decay, "weight_decay": 0.0},
+                ], lr=self.cfg.lr, momentum=self.cfg.momentum, stabilize=1)
+                if self.cfg.loss_type != 'triplet':
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+                if manifold is not None:
+                    remove_curvature_from_optimizer(optimizer, manifold)
+        else:
+            if self.cfg.optimizer_name == "adam":
+                optimizer = torch.optim.Adam([
+                    {"params": decay,    "weight_decay": wd},
+                    {"params": no_decay, "weight_decay": 0.0},
+                ], lr=self.cfg.lr)
+                if self.cfg.loss_type != 'triplet':
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+            else:
+                optimizer = torch.optim.SGD([
+                    {"params": decay,    "weight_decay": wd},
+                    {"params": no_decay, "weight_decay": 0.0},
+                ], lr=self.cfg.lr, momentum=self.cfg.momentum)
+                if self.cfg.loss_type != 'triplet':
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+
+        # Cosine schedule in epochs
+        for g in optimizer.param_groups:
+            g.setdefault('initial_lr', g['lr'])
+        scheduler = CosineLRScheduler(
+            optimizer,
+            t_initial=self.cfg.epochs,
+            lr_min=self.cfg.lr_min,
+            warmup_lr_init=self.cfg.lr_min,
+            warmup_t=self.cfg.warmup_t,
+            cycle_limit=1,
+            t_in_epochs=True,
+        )
+        return optimizer, scheduler
+
+
+# ------------------------------------------------------------------------------------------------
+# Training paradigms (Strategy)
+# ------------------------------------------------------------------------------------------------
+class TrainingParadigm:
+    REGISTRY: Dict[str, 'TrainingParadigm'] = {}
+
+    def __init_subclass__(cls, key: Optional[str] = None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if key:
+            TrainingParadigm.REGISTRY[key] = cls()  # type: ignore
+
+    def criterion_forward(self, head: nn.Module, feats: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def post_forward(self, feats: torch.Tensor, use_amp: bool) -> torch.Tensor:
+        # default: no change
+        return feats
+
+
+class ArcFaceParadigm(TrainingParadigm, key="arcface"):
+    def criterion_forward(self, head, feats, y):
+        return head(feats, y)
+
+
+class TripletParadigm(TrainingParadigm, key="triplet"):
+    def criterion_forward(self, head, feats, y):
+        return head(feats, y)
+
+
+# ------------------------------------------------------------------------------------------------
+# Core train/eval loop
+# ------------------------------------------------------------------------------------------------
+@torch.no_grad()
+def _eval_knn(backbone: nn.Module, ref_loader: DataLoader, val_loader: DataLoader, device: torch.device):
+    return evaluate_knn1(backbone, ref_loader, val_loader, device=device)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    head: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    scaler: Optional[amp.GradScaler] = None,
+    accumulation_steps: int = 1,
+    device: str = "cuda",
+    use_amp: bool = False,
+    paradigm: TrainingParadigm | None = None,
+):
+    model.train(); head.train()
+    steps_per_epoch = len(loader)
+    running_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    pbar = tqdm(enumerate(loader), total=steps_per_epoch, leave=False)
+
+    if paradigm is None:
+        raise ValueError("Training paradigm must be provided")
+
+    for i, batch in pbar:
+        x = batch[0].to(device, non_blocking=True)
+        y = batch[1].to(device, non_blocking=True)
+        with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float16, enabled=use_amp):
+            feats = model(x)
+            loss = paradigm.criterion_forward(head, feats, y) / accumulation_steps
+        feats = paradigm.post_forward(feats, use_amp)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        running_loss += loss.detach()
+        if (i + 1) % accumulation_steps == 0:
+            if scaler is not None:
+                scaler.step(optimizer); scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
+    return float(running_loss) / steps_per_epoch
+
+
+def fit(
+    cfg: Config,
+    backbone: nn.Module,
+    objective: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineLRScheduler,
+    ref_eval_set: WR10kDataset,
+    device: torch.device,
+    logger: WandbSession,
+    emb_dim: int,
+    manifold=None,
+):
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    best_loss = float('inf')
+    best_epoch = -1
+    no_improve = 0
+
+    paradigm = TrainingParadigm.REGISTRY[cfg.loss_type]
+    scaler = amp.GradScaler('cuda', enabled=cfg.use_amp)
+
+    for epoch in trange(1, cfg.epochs + 1, desc="Epochs"):
+        train_loss = train_one_epoch(
+            backbone, objective, train_loader, optimizer, epoch,
+            scaler=scaler, accumulation_steps=cfg.accumulation_steps, device=str(device),
+            use_amp=cfg.use_amp, paradigm=paradigm
+        )
+        scheduler.step(epoch + 1)
+
+        # Periodic validation (here we monitor train loss; retrieval eval is expensive)
+        if epoch % cfg.val_interval == 0 or epoch == cfg.epochs:
+            improved = train_loss < best_loss
+            if improved:
+                best_loss = train_loss; best_epoch = epoch; no_improve = 0
+                torch.save({
+                    'epoch': epoch,
+                    'model': backbone.state_dict(),
+                    'head': objective.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'seed': cfg.seed,
+                    'best_loss': best_loss,
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                }, os.path.join(cfg.save_dir, f'{cfg.run_name}_best_epoch{epoch}.pt'))
+                print(f"[VAL] New best @ epoch {epoch}: loss={best_loss:.4f} (saved)")
+            else:
+                no_improve += 1
+                print(f"[VAL] train_loss={train_loss:.4f} (best={best_loss:.4f} @ {best_epoch}) | patience {no_improve}/{cfg.patience}")
+
+            logger.log({
+                "val/train_loss": train_loss,
+                "val/best_loss": best_loss,
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+            })
+            if no_improve >= cfg.patience:
+                print(f"\nEarly stopping at epoch {epoch}")
+                break
+
+    torch.save({
+        'epoch': epoch,
+        'model': backbone.state_dict(),
+        'head': objective.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'seed': cfg.seed,
+        'best_loss': best_loss,
+        'best_epoch': best_epoch,
+    }, os.path.join(cfg.save_dir, f'{cfg.run_name}_final.pt'))
+    print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
+
+    # Evaluation (optionally convert to tangent for hyp)
+    eval_backbone = backbone
+    if cfg.hyperbolic and cfg.loss_type == 'triplet' and manifold is not None:
+        eval_backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
+        import warnings; warnings.warn("USING TANGENT HEAD FOR EVALUATION")
+
+    overall, per_dataset_acc = _eval_knn(eval_backbone, ref_eval_set, val_loader, device)
+    logger.log({"metrics/overall_acc": overall})
+    if logger.active and _wandb is not None:
+        table = _wandb.Table(columns=["dataset", "accuracy"])
+        for ds, acc in sorted(per_dataset_acc.items()):
+            table.add_data(ds, acc)
+            _wandb.summary[f"acc_by_dataset/{ds}"] = acc
+        logger.log({"per_dataset_accuracy_table": table})
+        logger.log({"plots/per_dataset_accuracy": _wandb.plot.bar(table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy")})
     else:
-        print("✗ Identity mismatch between splits!")
-        
+        print(f"Overall acc: {overall}.")
+
+
+# ------------------------------------------------------------------------------------------------
+# CLI / main
+# ------------------------------------------------------------------------------------------------
+
+def _parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Modular WR10k trainer")
+    p.add_argument('--run-name', type=str, default=Config.run_name)
+    p.add_argument('--seed', type=int, default=Config.seed)
+    p.add_argument('--save-dir', type=str, default=Config.save_dir)
+    p.add_argument('--root', type=str, default=Config.root)
+    p.add_argument('--img-size', type=int, default=Config.img_size)
+    p.add_argument('--num-workers', type=int, default=Config.num_workers)
+    p.add_argument('--train-batch', type=int, default=Config.train_batch)
+    p.add_argument('--eval-batch', type=int, default=Config.eval_batch)
+
+    p.add_argument('--model-name', type=str, default=Config.model_name,
+                   choices=['hyp_swin','megadescriptor_swin','megadescriptor_swin_pretrained','megadesc_replace_last_layer_hyperbolic'])
+    p.add_argument('--loss-type', type=str, default=Config.loss_type, choices=list(TrainingParadigm.REGISTRY.keys()))
+    p.add_argument('--hyperbolic', action='store_true', default=Config.hyperbolic)
+
+    p.add_argument('--epochs', type=int, default=Config.epochs)
+    p.add_argument('--lr', type=float, default=Config.lr)
+    p.add_argument('--wd', type=float, default=Config.wd)
+    p.add_argument('--momentum', type=float, default=Config.momentum)
+    p.add_argument('--warmup-t', type=int, default=Config.warmup_t)
+    p.add_argument('--lr-min', type=float, default=Config.lr_min)
+
+    p.add_argument('--accumulation-steps', type=int, default=Config.accumulation_steps)
+    p.add_argument('--use-amp', action='store_true', default=Config.use_amp)
+    p.add_argument('--val-interval', type=int, default=Config.val_interval)
+    p.add_argument('--patience', type=int, default=Config.patience)
+
+    p.add_argument('--wandb', type=str, default=Config.wandb_mode.value, choices=[m.value for m in WandbMode])
+    p.add_argument('--project', type=str, default=Config.project)
+
+    args = p.parse_args()
+    cfg = Config(
+        run_name=args.run_name,
+        seed=args.seed,
+        save_dir=args.save_dir,
+        root=args.root,
+        img_size=args.img_size,
+        num_workers=args.num_workers,
+        train_batch=args.train_batch,
+        eval_batch=args.eval_batch,
+        model_name=args.model_name,
+        loss_type=args.loss_type,
+        hyperbolic=args.hyperbolic,
+        epochs=args.epochs,
+        lr=args.lr,
+        wd=args.wd,
+        momentum=args.momentum,
+        warmup_t=args.warmup_t,
+        lr_min=args.lr_min,
+        accumulation_steps=args.accumulation_steps,
+        use_amp=args.use_amp,
+        val_interval=args.val_interval,
+        patience=args.patience,
+        wandb_mode=WandbMode(args.wandb),
+        project=args.project,
+    )
+    return cfg
+
 
 def main():
-    use_wandb = False
-    hyperbolic = True
-    checkpoint_path = None
-    P, K = 32, 4
-    effective_batch = P * K
-    accumulation_steps = 1
-    #checkpoint_path = "checkpoints/MegaDescriptor-B-224_best_epoch65.pt"
-    model_name = 'megadesc_replace_last_layer_hyperbolic'
-    
-    loss_type = 'triplet' # 'arcface' or 'triplet'
-    run_name='HypMegaDescriptor-S-224__lastlayerHypTrip'
-    if use_wandb:
-        wandb.login()
-        wandb.init(project="reproduce_mega_descriptor", name=run_name)
-    seed = 42;set_seed(seed)
-    dim = 224
-    train_tfms = T.Compose([
-         T.RandomResizedCrop(size=dim, scale=(0.7, 1.0), interpolation=T.InterpolationMode.BICUBIC),
-         #T.Resize((dim,dim)),
-         # T.RandomHorizontalFlip(p=0.5), # Breaks symmetry for some animals in some poses
-         T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
-         T.RandomGrayscale(p=0.10),
-         #T.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0)),
-         T.RandomApply([T.GaussianBlur(kernel_size=9, sigma=(0.1, 1.5))], p=0.2),
-         T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
-         T.ToTensor(),
-         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-         T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
-     ])
-    #train_tfms = T.Compose([
-    #    T.Resize((dim,dim)),
-    #    T.ToTensor(),
-    #    T.Normalize([0.5,0.5,0.5],[0.5,0.5,0.5]),
-    #])
-    val_tfms = T.Compose([
-        T.Resize(int(dim / 0.875), interpolation=T.InterpolationMode.BICUBIC),
-        T.CenterCrop(dim),
-        #T.Resize((dim,dim)),
-        T.ToTensor(),
-        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
+    cfg = _parse_args()
+    set_seed(cfg.seed)
 
+    # Build data
+    data = DataBuilder(cfg)
+    train_set, ref_eval_set, val_set, train_loader, ref_eval_loader, val_loader = data.build()
 
-    root = "/home/richw/.code/wildlifereid-10k"
-    meta = WildlifeReID10k(root)
-    df = meta.df
-    splitter = splits.ClosedSetSplit(ratio_train=0.8, col_label="identity") # keep IDs same in train/test
-    idx_ref, idx_qry = splitter.split(df)[0]
-    df_ref = df.iloc[idx_ref].copy()
-    df_qry = df.iloc[idx_qry].copy()
-
-    # ----- Ensure both splits contain the same identities -----
-    train_identities = set(df_ref['identity'].unique())
-    val_identities = set(df_qry['identity'].unique()) 
-    print(f"Train identities: {len(train_identities)}")
-    print(f"Val identities: {len(val_identities)}")
-    print(f"Identity overlap: {len(train_identities & val_identities)}")
-    # For ClosedSetSplit, these should be identical
-    if train_identities != val_identities:
-        print("WARNING: ClosedSetSplit should have identical identities in train/val!")
-        print(f"Train only: {train_identities - val_identities}")
-        print(f"Val only: {val_identities - train_identities}")
-        # Fix by using only common identities
-        common_identities = train_identities & val_identities
-        df_ref = df_ref[df_ref['identity'].isin(common_identities)].copy()
-        df_qry = df_qry[df_qry['identity'].isin(common_identities)].copy()
-        print(f"Using {len(common_identities)} common identities")
-    # Create datasets with consistent identity mapping
-    train_set = WR10kDataset(df_ref, root, train_tfms)
-    id_list = sorted(train_set.id2idx.keys())  # Get the canonical ordering
-    # Both ref and val datasets use the same id_list
-    ref_eval_set = WR10kDataset(df_ref, root, val_tfms, id_list=id_list)
-    val_set = WR10kDataset(df_qry, root, val_tfms, id_list=id_list)
-    debug_data_splits(train_set, val_set, ref_eval_set)
-
-    train_classes = set(train_set.id2idx.values())
-    val_classes   = set(val_set.id2idx.values())
-    assert train_classes == val_classes, \
-        f"Train/val class index mismatch: {train_classes ^ val_classes}"
-    
-    # train_labels = [train_set.id2idx[i] for i in train_set.df['identity']]
-    print("Total number of images TRAIN:", len(train_set))
-    print("Total number of images VAL:", len(val_set))
-    # sampler = PKSampler(train_labels, P=P, K=K)
-    # train_loader = DataLoader(train_set, batch_sampler=sampler, num_workers=8, pin_memory=True)
-    train_loader = DataLoader(train_set, batch_size=128, num_workers=16, pin_memory=True, drop_last=False, shuffle=True)
-    ref_eval_set_loader = DataLoader(ref_eval_set, batch_size=64, shuffle=False, num_workers=16, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=16, pin_memory=True)
-
-    if model_name == 'hyp_swin':
-        manifold = Lorentz()
-        lock_curvature_to_one(manifold)
-        backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32+1)
-        for p in backbone.parameters():
-            if isinstance(p, ManifoldParameter):
-                p.requires_grad_(False)
-        emb_dim = backbone.width - 1
-
-        backbone = nn.Sequential(
-            backbone,
-            LorentzEmbToTangent(manifold)
-        )
-    elif model_name == 'megadescriptor_swin':
-        backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=False)
-        emb_dim = backbone.num_features
-        backbone.apply(init_weights_xavier)
-    elif model_name == 'megadescriptor_swin_pretrained':
-        backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=True)
-        emb_dim = backbone.num_features
-        # write backbone model to txt file
-    elif model_name == 'megadesc_replace_last_layer_hyperbolic':
-        backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=True)
-        backbone, hyp_stages = replace_stages_with_hyperbolic(backbone, num_stages=1)
-
-        if hasattr(backbone, "norm"):  # LayerNorm(C_e) would break on C_e+1
-            backbone.norm = nn.Identity()
-        if hasattr(backbone, "global_pool"):  # ensure forward_features returns tokens
-            backbone.global_pool = ""
-        backbone.reset_classifier(num_classes=0, global_pool='')
-        # freeze original weights
-        for n, p in backbone.named_parameters():
-            p.requires_grad = False
-        # unfreeze the inserted hyperbolic block
-        for hyp_stage in hyp_stages:
-            for p in hyp_stage.parameters():
-                p.requires_grad = True
-        emb_dim = 1025
-        manifold = hyp_stages[-1].manifold
-    else:
-        raise ValueError(f"Unknown model_name {model_name}")
-
-    with open(f"{model_name}_model.txt", "w") as f:
-        f.write(str(backbone))
-
-
-    if checkpoint_path:
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        backbone.load_state_dict(ckpt["model"])
-    
-
+    # Build model, objective, optim/sched
+    mb = ModelBuilder(cfg)
+    backbone, emb_dim, manifold = mb.build()
     num_classes = train_set.num_classes
-    if loss_type == 'arcface':
-        objective = ArcFaceLoss(
-            num_classes=num_classes,
-            embedding_size=emb_dim,
-            margin=0.5, scale=64
-        )
-    elif loss_type == 'triplet':
-        if hyperbolic:
-            objective = LorentzTripletLoss(manifold, margin=0.2, type_of_triplets='hard', feature_dim=1025)
-        else:
-            raise
-            objective = nn.TripletMarginLoss(margin=0.2, p=2)
-    
-    for name, param in objective.named_parameters():
-        if param.requires_grad:
-            print(name, param.shape)
+    objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
 
-    epochs = 40
-    wd = 1e-4
-    #backbone_params = [p for p in backbone.parameters() if p.requires_grad]
-    backbone_decay, backbone_no_decay = split_decay_groups(backbone)
+    ob = OptimBuilder(cfg)
+    optimizer, scheduler = ob.build(backbone, objective, manifold)
 
-    head_params = [p for p in objective.parameters() if p.requires_grad]
-    print(f"Num classes: {train_set.num_classes}")
-    print(f"Backbone: decay={sum(p.numel() for p in backbone_decay)}, "
-      f"no_decay={sum(p.numel() for p in backbone_no_decay)}, "
-      f"head={sum(p.numel() for p in head_params)}")
-    if hyperbolic:
-        optimizer = RiemannianSGD(
-            [
-                {"params": backbone_decay,     "weight_decay": wd},
-                {"params": backbone_no_decay,  "weight_decay": 0.0},  
-            ],
-            lr=1e-3, momentum=0.9, stabilize=1
-        )
-        optimizer.add_param_group({"params": head_params, "weight_decay": 0.0}) if not loss_type == 'triplet' else None
-        remove_curvature_from_optimizer(optimizer, manifold)
-    else:
-        optimizer = torch.optim.SGD(
-            [
-                {"params": backbone_decay,     "weight_decay": wd},
-                {"params": backbone_no_decay,  "weight_decay": 0.0},  # LayerNorms & biases
-            ],
-            lr=1e-3, momentum=0.9
-        )
-        optimizer.add_param_group({"params": head_params, "weight_decay": 0.0}) if not loss_type == 'triplet' else None
-  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     backbone = backbone.to(device)
     objective = objective.to(device)
 
-    steps_per_epoch = len(train_loader)
-    for g in optimizer.param_groups:
-        if 'initial_lr' not in g:
-            g['initial_lr'] = g['lr']
+    # W&B session
+    with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
+        # If sweep/online provides runtime overrides, apply the obvious ones
+        live = wb.cfg
+        # Lightweight, safe override application
+        for k in ["lr","wd","epochs","train_batch","eval_batch","img_size","accumulation_steps","use_amp","val_interval","patience"]:
+            if k in live:
+                setattr(cfg, k, type(getattr(cfg, k))(live[k]))
+        # Train
+        fit(cfg, backbone, objective, train_loader, val_loader, optimizer, scheduler, ref_eval_loader, device, wb, emb_dim, manifold)
 
-    scheduler = CosineLRScheduler(
-        optimizer,
-        t_initial=epochs,
-        lr_min=1e-6,
-        warmup_lr_init=1e-6,
-        warmup_t=5,
-        cycle_limit=1,
-        t_in_epochs=True
-    )
-    use_amp=False
-    scaler = amp.GradScaler('cuda', enabled=use_amp)
-    if not checkpoint_path:
-        train(epochs, backbone, objective, train_loader, val_loader, optimizer, scheduler, 
-              ref_eval_set, seed, use_wandb, use_amp=use_amp, scaler=scaler, 
-              accumulation_steps=accumulation_steps, run_name=run_name, embed_dim=emb_dim, 
-              device=device, num_classes=num_classes,
-              )
-    
-    if hyperbolic:
-        backbone = nn.Sequential(
-                backbone,
-                LorentzEmbToTangent(manifold)
-            )
-        import warnings
-        warnings.warn("USING TANGENT HEAD FOR EVALUATION")
-
-    # Per dataset accuracy and wandb logging
-    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device)
-    if use_wandb:
-        wandb.log({"metrics/overall_acc": overall})
-        for ds, acc in per_dataset_acc.items():
-            wandb.summary[f"acc_by_dataset/{ds}"] = acc
-        table = wandb.Table(columns=["dataset", "accuracy"])
-        for ds, acc in sorted(per_dataset_acc.items()):
-            table.add_data(ds, acc)
-        wandb.log({"per_dataset_accuracy_table": table})
-        wandb.log({
-            "plots/per_dataset_accuracy":
-                wandb.plot.bar(table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy")
-        })
-        wandb.finish()
-    else:
-        print(f"Overall acc: {overall}.")
 
 if __name__ == '__main__':
     main()

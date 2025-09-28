@@ -1,0 +1,17 @@
+program: train_wr10k_modular.py
+method: bayes
+metric:
+  name: val/best_loss
+  goal: minimize
+parameters:
+  lr:        {min: 1e-4, max: 5e-3, distribution: log_uniform}
+  wd:        {values: [0.0, 1e-5, 1e-4]}
+  epochs:    {values: [20, 30, 40]}
+  optimizer_name: {values: ["sgd", "adam"]}
+command:
+  - python
+  - ${program}
+  - --wandb
+  - sweep
+  - --run-name
+  - ${group}-${trial}
