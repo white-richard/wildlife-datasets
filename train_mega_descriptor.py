@@ -1,7 +1,5 @@
 import os
 import random
-from collections import defaultdict
-import pickle
 
 import torch
 import torch.nn as nn
@@ -520,7 +518,7 @@ def main():
         warnings.warn("USING TANGENT HEAD FOR EVALUATION")
 
     # Per dataset accuracy and wandb logging
-    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device, dataset_col='dataset', force_rebuild=True)
+    overall, per_dataset_acc = evaluate_knn1(backbone, ref_eval_set_loader, val_loader, device=device, force_rebuild=True)
     if use_wandb:
         wandb.log({"metrics/overall_acc": overall})
         for ds, acc in per_dataset_acc.items():

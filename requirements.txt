@@ -6,3 +6,4 @@ timm
 tqdm
 wandb
 pytorch-metric-learning
+torch-scatter
