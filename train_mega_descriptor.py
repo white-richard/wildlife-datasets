@@ -186,6 +186,19 @@ class DataBuilder:
             T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
             T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
         ])
+    
+    def _train_tfms(self) -> T.Compose:
+        d = self.cfg.img_size
+        return T.Compose([
+            T.RandomResizedCrop(size=d, scale=(0.7, 1.0), interpolation=T.InterpolationMode.BICUBIC),
+            T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
+            T.RandomGrayscale(p=0.10),
+            T.RandomApply([T.GaussianBlur(kernel_size=9, sigma=(0.1, 1.5))], p=0.2),
+            T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
+            T.ToTensor(),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
+        ])
 
     def _eval_tfms(self) -> T.Compose:
         d = self.cfg.img_size
@@ -554,6 +567,8 @@ def _parse_args() -> Config:
     p.add_argument('--momentum', type=float, default=Config.momentum)
     p.add_argument('--warmup-t', type=int, default=Config.warmup_t)
     p.add_argument('--lr-min', type=float, default=Config.lr_min)
+    p.add_argument('--optimizer-name', type=str, default=Config.optimizer_name,
+                   choices=['sgd','adam'])
 
     p.add_argument('--accumulation-steps', type=int, default=Config.accumulation_steps)
     p.add_argument('--use-amp', action='store_true', default=Config.use_amp)
@@ -588,6 +603,7 @@ def _parse_args() -> Config:
         patience=args.patience,
         wandb_mode=WandbMode(args.wandb),
         project=args.project,
+        optimizer_name=args.optimizer_name,
     )
     return cfg
 
@@ -595,35 +611,34 @@ def _parse_args() -> Config:
 def main():
     cfg = _parse_args()
     set_seed(cfg.seed)
-
-    # Build data
-    data = DataBuilder(cfg)
-    train_set, ref_eval_set, val_set, train_loader, ref_eval_loader, val_loader = data.build()
-
-    # Build model, objective, optim/sched
-    mb = ModelBuilder(cfg)
-    backbone, emb_dim, manifold = mb.build()
-    num_classes = train_set.num_classes
-    objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
-
-    ob = OptimBuilder(cfg)
-    optimizer, scheduler = ob.build(backbone, objective, manifold)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    backbone = backbone.to(device)
-    objective = objective.to(device)
-
-    # W&B session
+    # Open W&B first so sweep values are available
     with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
-        # If sweep/online provides runtime overrides, apply the obvious ones
-        live = wb.cfg
-        # Lightweight, safe override application
-        for k in ["lr","wd","epochs","train_batch","eval_batch","img_size","accumulation_steps","use_amp","val_interval","patience"]:
+        live = wb.cfg  # this is wandb.config (sweep values if present)
+        # allow-list of keys we accept from sweeps
+        for k in [
+            "lr","wd","epochs","train_batch","eval_batch","img_size",
+            "accumulation_steps","use_amp","val_interval","patience","optimizer_name"
+        ]:
             if k in live:
                 setattr(cfg, k, type(getattr(cfg, k))(live[k]))
+
+        # Build everything from the (possibly) overridden cfg
+        data = DataBuilder(cfg)
+        train_set, ref_eval_set, val_set, train_loader, ref_eval_loader, val_loader = data.build()
+
+        mb = ModelBuilder(cfg)
+        backbone, emb_dim, manifold = mb.build()
+        num_classes = train_set.num_classes
+        objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
+
+        ob = OptimBuilder(cfg)
+        optimizer, scheduler = ob.build(backbone, objective, manifold)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        backbone = backbone.to(device); objective = objective.to(device)
+
         # Train
-        fit(cfg, backbone, objective, train_loader, val_loader, optimizer, scheduler, ref_eval_loader, device, wb, emb_dim, manifold)
-
-
+        fit(cfg, backbone, objective, train_loader, val_loader, optimizer, scheduler,
+            ref_eval_loader, device, wb, emb_dim, manifold)
 if __name__ == '__main__':
     main()
