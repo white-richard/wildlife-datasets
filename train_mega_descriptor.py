@@ -108,10 +108,6 @@ class Config:
     wandb_mode: WandbMode = WandbMode.OFF
     project: str = "reproduce_mega_descriptor"
 
-
-# ------------------------------------------------------------------------------------------------
-# Helper modules & builders
-# ------------------------------------------------------------------------------------------------
 class LorentzEmbToTangent(nn.Module):
     def __init__(self, manifold):
         super().__init__()
@@ -244,8 +240,13 @@ class ModelBuilder:
             for p in backbone.parameters():
                 if isinstance(p, ManifoldParameter):
                     p.requires_grad_(False)
-            emb_dim = backbone.width - 1
-            backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
+            backbone.eval()
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, self.cfg.img_size, self.cfg.img_size)
+                out = backbone(dummy)
+            backbone.train()
+            emb_dim = out.shape[1]
+            # backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
 
         elif model_name == 'megadescriptor_swin':
             backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=False)
@@ -277,7 +278,6 @@ class ModelBuilder:
                 out = backbone(dummy)
             backbone.train()
             emb_dim = out.shape[1]
-            print(f"Final embedding dim: {emb_dim}!!!")
             manifold = hyp_stages[-1].manifold
         else:
             raise ValueError(f"Unknown model_name {model_name}")
@@ -412,6 +412,9 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(enumerate(loader), total=steps_per_epoch, leave=False)
 
+    running_acc = 0.0
+    acc_count = 0
+
     if paradigm is None:
         raise ValueError("Training paradigm must be provided")
 
@@ -444,11 +447,15 @@ def train_one_epoch(
                             feats.detach(), y, bank,
                             k=3, T=0.07, num_classes=train_set.num_classes 
                         )
+                        running_acc += acc
+                        acc_count += 1
                     else:
                         acc = knn_top1_on_batch(
                             feats.detach(), y, bank,
                             k=3, T=0.07, num_classes=train_set.num_classes  
                         )
+                        running_acc += acc
+                        acc_count += 1
                     if _wandb.run is not None:
                         _wandb.log({
                             "train/knn@3": acc,
@@ -460,9 +467,9 @@ def train_one_epoch(
                             f"| loss {float(running_loss)/(i+1):.4f} | knn@3 {acc:.4f}")
 
         bank.enqueue(feats.detach(), y)  # add to memory bank
-        pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
-    return float(running_loss) / steps_per_epoch, acc
-
+        pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}",)
+    avg_acc = float(running_acc) / acc_count if acc_count > 0 else float("nan")
+    return float(running_loss) / steps_per_epoch, avg_acc
 
 def fit(
     cfg: Config,
