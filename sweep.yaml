@@ -5,20 +5,22 @@ metric:
   name: val/best_loss
   goal: minimize
 parameters:
-  lr:
-    distribution: log_uniform_values
-    min: 0.0001
-    max: 0.005
-  wd:
-    values: [0.0, 1e-5, 1e-4]
-  epochs:
-    values: [20, 30, 40]
-  optimizer_name:
-    values: ["sgd", "adam"]
+  # lr:
+  #   distribution: log_uniform_values
+  #   min: 0.0001
+  #   max: 0.005
+  # wd:
+  #   values: [0.0, 1e-5, 1e-4]
+  # epochs:
+  #   values: [20, 30, 40]
+  # optimizer_name:
+  #   values: ["sgd", "adam"]
+  aug_policy:
+    values: ["baseline", "weak", "strong", "randaug", "augmix"]
 command:
   - python
   - ${program}
   - --wandb
   - sweep
   - --run-name
-  - sweep-${trial_id}
+  - sweep-${trial_id}-aug_policy

@@ -13,14 +13,10 @@ This file keeps your original custom dependencies but isolates them behind build
 """
 from __future__ import annotations
 import os
-import sys
-import json
-import math
 import random
 import argparse
 from dataclasses import dataclass, asdict
-from enum import Enum
-from typing import Optional, Tuple, Dict, Any, Iterable, List
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 
@@ -50,7 +46,12 @@ from hypercore.modules.loss import LorentzTripletLoss
 from eucTohyp_Swin import replace_stages_with_hyperbolic
 from wr10k_dataset import WR10kDataset
 from knn_per_class import evaluate_knn1
+from hyp_knn_per_class import evaluate_knn1 as hyp_evaluate_knn1
 from wandb_session import WandbSession, WandbMode
+from augmentations import AugCfg, build_train_tfms
+from knn_val_monitor import MemoryBankQueue, knn_top1_on_batch
+from hyp_knn_val_monitor import knn_top1_on_batch_lorentz as hyp_knn_top1_on_batch, MemoryBankQueue as HypMemoryBankQueue
+
 
 torch.backends.cudnn.benchmark = True
 
@@ -76,11 +77,12 @@ class Config:
     save_dir: str = "checkpoints"
 
     # data
-    root: str = "/home/richw/.code/wildlifereid-10k"
+    root: str = "/home/richw/.richie/repos/wildlifereid-10k"
     img_size: int = 224
     num_workers: int = 16
     train_batch: int = 128
     eval_batch: int = 128
+    aug_policy: str = "baseline"  # baseline | weak | strong | randaug | augmix
 
     # model / paradigm
     model_name: str = "megadesc_replace_last_layer_hyperbolic"  # choices below
@@ -173,33 +175,10 @@ def remove_curvature_from_optimizer(optimizer, manifold) -> None:
 class DataBuilder:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-
+        self.aug_cfg = AugCfg(self.cfg.aug_policy)
     def _train_tfms(self) -> T.Compose:
-        d = self.cfg.img_size
-        return T.Compose([
-            T.RandomResizedCrop(size=d, scale=(0.7, 1.0), interpolation=T.InterpolationMode.BICUBIC),
-            T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
-            T.RandomGrayscale(p=0.10),
-            T.RandomApply([T.GaussianBlur(kernel_size=9, sigma=(0.1, 1.5))], p=0.2),
-            T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
-            T.ToTensor(),
-            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
-        ])
+        return build_train_tfms(self.cfg.img_size, self.aug_cfg)
     
-    def _train_tfms(self) -> T.Compose:
-        d = self.cfg.img_size
-        return T.Compose([
-            T.RandomResizedCrop(size=d, scale=(0.7, 1.0), interpolation=T.InterpolationMode.BICUBIC),
-            T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
-            T.RandomGrayscale(p=0.10),
-            T.RandomApply([T.GaussianBlur(kernel_size=9, sigma=(0.1, 1.5))], p=0.2),
-            T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
-            T.ToTensor(),
-            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
-        ])
-
     def _eval_tfms(self) -> T.Compose:
         d = self.cfg.img_size
         return T.Compose([
@@ -291,9 +270,15 @@ class ModelBuilder:
             for hyp_stage in hyp_stages:
                 for p in hyp_stage.parameters():
                     p.requires_grad = True
-            emb_dim = 1025
+            # emb_dim = 2049  # 2048 + 1 (time coord)
+            backbone.eval()
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, self.cfg.img_size, self.cfg.img_size)
+                out = backbone(dummy)
+            backbone.train()
+            emb_dim = out.shape[1]
+            print(f"Final embedding dim: {emb_dim}!!!")
             manifold = hyp_stages[-1].manifold
-
         else:
             raise ValueError(f"Unknown model_name {model_name}")
 
@@ -399,11 +384,10 @@ class TripletParadigm(TrainingParadigm, key="triplet"):
         return head(feats, y)
 
 
-# ------------------------------------------------------------------------------------------------
-# Core train/eval loop
-# ------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def _eval_knn(backbone: nn.Module, ref_loader: DataLoader, val_loader: DataLoader, device: torch.device):
+def _eval_knn(backbone: nn.Module, ref_loader: DataLoader, val_loader: DataLoader, device: torch.device, hyperbolic: bool = False, manifold=None) -> Tuple[float, Dict[str, float]]:
+    if hyperbolic:
+        return hyp_evaluate_knn1(backbone, ref_loader, val_loader, device=device, manifold=manifold)
     return evaluate_knn1(backbone, ref_loader, val_loader, device=device)
 
 
@@ -418,6 +402,9 @@ def train_one_epoch(
     device: str = "cuda",
     use_amp: bool = False,
     paradigm: TrainingParadigm | None = None,
+    train_set: WR10kDataset | None = None,
+    bank: MemoryBankQueue | None = None,
+    hyperbolic: bool = False,
 ):
     model.train(); head.train()
     steps_per_epoch = len(loader)
@@ -446,8 +433,35 @@ def train_one_epoch(
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+        
+        if (i % 10 == 0) or (i == steps_per_epoch - 1):
+            with torch.no_grad():
+                # only compute if we have any valid labels (-1 means empty)
+                _, y_bank = bank.tensors()
+                if y_bank is not None and (y_bank != -1).any():
+                    if hyperbolic:
+                        acc = hyp_knn_top1_on_batch(
+                            feats.detach(), y, bank,
+                            k=3, T=0.07, num_classes=train_set.num_classes 
+                        )
+                    else:
+                        acc = knn_top1_on_batch(
+                            feats.detach(), y, bank,
+                            k=3, T=0.07, num_classes=train_set.num_classes  
+                        )
+                    if _wandb.run is not None:
+                        _wandb.log({
+                            "train/knn@3": acc,
+                            "train/iter": epoch * steps_per_epoch + i + 1,
+                            "epoch": epoch,
+                        })
+                    else:
+                        print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
+                            f"| loss {float(running_loss)/(i+1):.4f} | knn@3 {acc:.4f}")
+
+        bank.enqueue(feats.detach(), y)  # add to memory bank
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
-    return float(running_loss) / steps_per_epoch
+    return float(running_loss) / steps_per_epoch, acc
 
 
 def fit(
@@ -466,25 +480,39 @@ def fit(
 ):
     os.makedirs(cfg.save_dir, exist_ok=True)
     best_loss = float('inf')
+    best_acc = -float('inf')
     best_epoch = -1
     no_improve = 0
+
+    if cfg.hyperbolic and cfg.loss_type != 'triplet':
+        raise ValueError("Hyperbolic training is only supported with triplet loss currently.")
 
     paradigm = TrainingParadigm.REGISTRY[cfg.loss_type]
     scaler = amp.GradScaler('cuda', enabled=cfg.use_amp)
 
+    if cfg.hyperbolic:
+        bank = HypMemoryBankQueue(manifold, K=5000, feat_dim=emb_dim, store_labels=True, device=device)
+    else:
+        bank = MemoryBankQueue(K=5000, feat_dim=emb_dim, store_labels=True, device=device)
+    train_set = train_loader.dataset if isinstance(train_loader.dataset, WR10kDataset) else None
+    if train_set is None: raise ValueError("train_loader.dataset must be WR10kDataset to use knn monitoring")
+
     for epoch in trange(1, cfg.epochs + 1, desc="Epochs"):
-        train_loss = train_one_epoch(
+        train_loss, train_acc = train_one_epoch(
             backbone, objective, train_loader, optimizer, epoch,
             scaler=scaler, accumulation_steps=cfg.accumulation_steps, device=str(device),
-            use_amp=cfg.use_amp, paradigm=paradigm
+            use_amp=cfg.use_amp, paradigm=paradigm, train_set=train_set, bank=bank,
+            hyperbolic=cfg.hyperbolic,
         )
         scheduler.step(epoch + 1)
 
         # Periodic validation (here we monitor train loss; retrieval eval is expensive)
         if epoch % cfg.val_interval == 0 or epoch == cfg.epochs:
-            improved = train_loss < best_loss
+            # improved = train_loss < best_loss
+            improved = train_acc > best_acc
+
             if improved:
-                best_loss = train_loss; best_epoch = epoch; no_improve = 0
+                best_acc = train_acc; best_epoch = epoch; no_improve = 0
                 torch.save({
                     'epoch': epoch,
                     'model': backbone.state_dict(),
@@ -492,14 +520,20 @@ def fit(
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'seed': cfg.seed,
-                    'best_loss': best_loss,
+                    'best_acc': best_acc,
                     'learning_rate': optimizer.param_groups[0]['lr'],
                 }, os.path.join(cfg.save_dir, f'{cfg.run_name}_best_epoch{epoch}.pt'))
-                print(f"[VAL] New best @ epoch {epoch}: loss={best_loss:.4f} (saved)")
+                print(f"[VAL] New best @ epoch {epoch}: knn_acc={best_acc:.4f} (saved)")
             else:
                 no_improve += 1
-                print(f"[VAL] train_loss={train_loss:.4f} (best={best_loss:.4f} @ {best_epoch}) | patience {no_improve}/{cfg.patience}")
-
+                print(f"[VAL] train_loss={train_loss:.4f} (best={best_acc:.4f} @ {best_epoch}) | patience {no_improve}/{cfg.patience}")
+            
+            if _wandb.run is not None:
+                _wandb.log({
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                })
+            
             logger.log({
                 "val/train_loss": train_loss,
                 "val/best_loss": best_loss,
@@ -522,13 +556,8 @@ def fit(
     }, os.path.join(cfg.save_dir, f'{cfg.run_name}_final.pt'))
     print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
 
-    # Evaluation (optionally convert to tangent for hyp)
-    eval_backbone = backbone
-    if cfg.hyperbolic and cfg.loss_type == 'triplet' and manifold is not None:
-        eval_backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
-        import warnings; warnings.warn("USING TANGENT HEAD FOR EVALUATION")
 
-    overall, per_dataset_acc = _eval_knn(eval_backbone, ref_eval_set, val_loader, device)
+    overall, per_dataset_acc = _eval_knn(backbone, ref_eval_set, val_loader, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
     logger.log({"metrics/overall_acc": overall})
     if logger.active and _wandb is not None:
         table = _wandb.Table(columns=["dataset", "accuracy"])
@@ -540,10 +569,6 @@ def fit(
     else:
         print(f"Overall acc: {overall}.")
 
-
-# ------------------------------------------------------------------------------------------------
-# CLI / main
-# ------------------------------------------------------------------------------------------------
 
 def _parse_args() -> Config:
     p = argparse.ArgumentParser(description="Modular WR10k trainer")
@@ -617,7 +642,8 @@ def main():
         # allow-list of keys we accept from sweeps
         for k in [
             "lr","wd","epochs","train_batch","eval_batch","img_size",
-            "accumulation_steps","use_amp","val_interval","patience","optimizer_name"
+            "accumulation_steps","use_amp","val_interval","patience","optimizer_name",
+            "aug_policy"
         ]:
             if k in live:
                 setattr(cfg, k, type(getattr(cfg, k))(live[k]))
