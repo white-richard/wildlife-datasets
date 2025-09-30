@@ -51,6 +51,8 @@ from wandb_session import WandbSession, WandbMode
 from augmentations import AugCfg, build_train_tfms
 from knn_val_monitor import MemoryBankQueue, knn_top1_on_batch
 from hyp_knn_val_monitor import knn_top1_on_batch_lorentz as hyp_knn_top1_on_batch, MemoryBankQueue as HypMemoryBankQueue
+from reid_split_wr10k import build_reid_pipeline
+from validation import validate_split
 
 
 torch.backends.cudnn.benchmark = True
@@ -185,9 +187,46 @@ class DataBuilder:
         ])
 
     def build(self):
+
+        splits_out = build_reid_pipeline(
+            self.cfg,
+            train_transform=self._train_tfms(),
+            val_transform=self._eval_tfms(),
+            col_label="identity",
+            frac_train_ids=0.8,      # 80% IDs used for training, 20% reserved for test
+            ratio_fit=0.9,           # within-training images: 90% for fitting, 10% for dev
+            ratio_gallery_dev=0.5,   # dev gallery/query ratio
+            ratio_gallery_test=0.5,  # test gallery/query ratio
+        )
+        train_fit_loader = splits_out.train_fit_loader  # batches for optimizing weights
+        val_ref_loader   = splits_out.dev_ref_loader    # eval: gallery (val)
+        val_qry_loader   = splits_out.dev_qry_loader    # eval: query  (val)
+        test_ref_loader  = splits_out.test_ref_loader   # eval: gallery (test)
+        test_qry_loader  = splits_out.test_qry_loader   # eval: query  (test)
+        train_fit_set = splits_out.train_fit_set
+        loaders = {
+            "train": train_fit_loader,
+            "val_ref": val_ref_loader,
+            "val_qry": val_qry_loader,
+            "test_ref": test_ref_loader,
+            "test_qry": test_qry_loader,
+        }
+        dev_ref_set   = splits_out.dev_ref_set
+        dev_qry_set   = splits_out.dev_qry_set
+        test_ref_set  = splits_out.test_ref_set
+        test_qry_set  = splits_out.test_qry_set
+        datasets = {
+            "train": train_fit_set,
+            "val_ref": dev_ref_set,
+            "val_qry": dev_qry_set,
+            "test_ref": test_ref_set,
+            "test_qry": test_qry_set,
+        }
+        return loaders, datasets
+
         meta = WildlifeReID10k(self.cfg.root)
         df = meta.df
-        splitter = splits.ClosedSetSplit(ratio_train=0.8, col_label="identity")
+        splitter = splits.ClosedSetSplit(ratio_train=0.9, col_label="identity")
         idx_ref, idx_qry = splitter.split(df)[0]
         df_ref = df.iloc[idx_ref].copy()
         df_qry = df.iloc[idx_qry].copy()
@@ -385,16 +424,18 @@ class TripletParadigm(TrainingParadigm, key="triplet"):
 
 
 @torch.no_grad()
-def _eval_knn(backbone: nn.Module, ref_loader: DataLoader, val_loader: DataLoader, device: torch.device, hyperbolic: bool = False, manifold=None) -> Tuple[float, Dict[str, float]]:
+def _eval_knn(backbone: nn.Module, loaders: List[DataLoader], device: torch.device, hyperbolic: bool = False, manifold=None) -> Tuple[float, Dict[str, float]]:
+    ref_loader = loaders['test_ref']
+    qry_loader = loaders['test_qry']
     if hyperbolic:
-        return hyp_evaluate_knn1(backbone, ref_loader, val_loader, device=device, manifold=manifold)
-    return evaluate_knn1(backbone, ref_loader, val_loader, device=device)
+        return hyp_evaluate_knn1(backbone, ref_loader, qry_loader, device=device, manifold=manifold)
+    return evaluate_knn1(backbone, ref_loader, qry_loader, device=device)
 
 
 def train_one_epoch(
     model: nn.Module,
     head: nn.Module,
-    loader: DataLoader,
+    loaders: List[DataLoader],
     optimizer: torch.optim.Optimizer,
     epoch: int,
     scaler: Optional[amp.GradScaler] = None,
@@ -406,14 +447,17 @@ def train_one_epoch(
     bank: MemoryBankQueue | None = None,
     hyperbolic: bool = False,
 ):
+    train_loader = loaders['train']
     model.train(); head.train()
-    steps_per_epoch = len(loader)
+    steps_per_epoch = len(train_loader)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
-    pbar = tqdm(enumerate(loader), total=steps_per_epoch, leave=False)
+    pbar = tqdm(enumerate(train_loader), total=steps_per_epoch, leave=False)
 
-    running_acc = 0.0
-    acc_count = 0
+    validate_every = max(1, steps_per_epoch - 1)
+
+    running_metric = 0.0
+    metric_count = 0
 
     if paradigm is None:
         raise ValueError("Training paradigm must be provided")
@@ -437,49 +481,76 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         
-        if (i % 10 == 0) or (i == steps_per_epoch - 1):
+        if (i % validate_every == 0) or (i == steps_per_epoch - 1):
             with torch.no_grad():
-                # only compute if we have any valid labels (-1 means empty)
-                _, y_bank = bank.tensors()
-                if y_bank is not None and (y_bank != -1).any():
-                    if hyperbolic:
-                        acc = hyp_knn_top1_on_batch(
-                            feats.detach(), y, bank,
-                            k=3, T=0.07, num_classes=train_set.num_classes 
-                        )
-                        running_acc += acc
-                        acc_count += 1
-                    else:
-                        acc = knn_top1_on_batch(
-                            feats.detach(), y, bank,
-                            k=3, T=0.07, num_classes=train_set.num_classes  
-                        )
-                        running_acc += acc
-                        acc_count += 1
-                    if _wandb.run is not None:
-                        _wandb.log({
-                            "train/knn@3": acc,
-                            "train/iter": epoch * steps_per_epoch + i + 1,
-                            "epoch": epoch,
-                        })
-                    else:
-                        print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
-                            f"| loss {float(running_loss)/(i+1):.4f} | knn@3 {acc:.4f}")
+                metrics = validate_split(
+                    model=model,
+                    loaders=loaders,
+                    split_prefix="val",  # uses "val_ref" and "val_qry"
+                    device=device,
+                    use_amp=use_amp,
+                    sim_metric="neg_lorentz_geo" if hyperbolic else "cosine",
+                )
+                mAP = metrics['mAP']
+                acc1 = metrics['top1']
+                acc5 = metrics['top5']
+                acc10 = metrics['top1']
+                running_metric += mAP
+                metric_count += 1
+                if _wandb.run is not None:
+                    _wandb.log({
+                        "train/val_mAP": mAP,
+                        "train/val_top1": acc1,
+                        "train/val_top5": acc5,
+                        "train/val_top10": acc10,
+                        "train/iter": epoch * steps_per_epoch + i + 1,
+                        "epoch": epoch,
+                    })
+                else:
+                    print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
+                        f"| loss {float(running_loss)/(i+1):.4f} | val_mAP {mAP:.4f} | val_top1 {acc1:.4f} | val_top5 {acc5:.4f} | val_top10 {acc10:.4f}")
+        
+        # if (i % 10 == 0) or (i == steps_per_epoch - 1):
+        #     with torch.no_grad():
+        #         # only compute if we have any valid labels (-1 means empty)
+        #         _, y_bank = bank.tensors()
+        #         if y_bank is not None and (y_bank != -1).any():
+        #             if hyperbolic:
+        #                 acc = hyp_knn_top1_on_batch(
+        #                     feats.detach(), y, bank,
+        #                     k=3, T=0.07, num_classes=train_set.num_classes 
+        #                 )
+        #                 running_acc += acc
+        #                 acc_count += 1
+        #             else:
+        #                 acc = knn_top1_on_batch(
+        #                     feats.detach(), y, bank,
+        #                     k=3, T=0.07, num_classes=train_set.num_classes  
+        #                 )
+        #                 running_acc += acc
+        #                 acc_count += 1
+        #             if _wandb.run is not None:
+        #                 _wandb.log({
+        #                     "train/knn@3": acc,
+        #                     "train/iter": epoch * steps_per_epoch + i + 1,
+        #                     "epoch": epoch,
+        #                 })
+        #             else:
+        #                 print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
+        #                     f"| loss {float(running_loss)/(i+1):.4f} | knn@3 {acc:.4f}")
 
-        bank.enqueue(feats.detach(), y)  # add to memory bank
+        # bank.enqueue(feats.detach(), y)  # add to memory bank
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}",)
-    avg_acc = float(running_acc) / acc_count if acc_count > 0 else float("nan")
+    avg_acc = float(running_metric) / metric_count if metric_count > 0 else float("nan")
     return float(running_loss) / steps_per_epoch, avg_acc
 
 def fit(
     cfg: Config,
     backbone: nn.Module,
     objective: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+    loaders: List[DataLoader],
     optimizer: torch.optim.Optimizer,
     scheduler: CosineLRScheduler,
-    ref_eval_set: WR10kDataset,
     device: torch.device,
     logger: WandbSession,
     emb_dim: int,
@@ -487,7 +558,7 @@ def fit(
 ):
     os.makedirs(cfg.save_dir, exist_ok=True)
     best_loss = float('inf')
-    best_acc = -float('inf')
+    best_mAP = -float('inf')
     best_epoch = -1
     no_improve = 0
 
@@ -501,55 +572,48 @@ def fit(
         bank = HypMemoryBankQueue(manifold, K=5000, feat_dim=emb_dim, store_labels=True, device=device)
     else:
         bank = MemoryBankQueue(K=5000, feat_dim=emb_dim, store_labels=True, device=device)
-    train_set = train_loader.dataset if isinstance(train_loader.dataset, WR10kDataset) else None
-    if train_set is None: raise ValueError("train_loader.dataset must be WR10kDataset to use knn monitoring")
 
     for epoch in trange(1, cfg.epochs + 1, desc="Epochs"):
-        train_loss, train_acc = train_one_epoch(
-            backbone, objective, train_loader, optimizer, epoch,
+        train_loss, train_mAP = train_one_epoch(
+            backbone, objective, loaders, optimizer, epoch,
             scaler=scaler, accumulation_steps=cfg.accumulation_steps, device=str(device),
-            use_amp=cfg.use_amp, paradigm=paradigm, train_set=train_set, bank=bank,
+            use_amp=cfg.use_amp, paradigm=paradigm, bank=bank,
             hyperbolic=cfg.hyperbolic,
         )
         scheduler.step(epoch + 1)
 
-        # Periodic validation (here we monitor train loss; retrieval eval is expensive)
-        if epoch % cfg.val_interval == 0 or epoch == cfg.epochs:
-            # improved = train_loss < best_loss
-            improved = train_acc > best_acc
-
-            if improved:
-                best_acc = train_acc; best_epoch = epoch; no_improve = 0
-                torch.save({
-                    'epoch': epoch,
-                    'model': backbone.state_dict(),
-                    'head': objective.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'seed': cfg.seed,
-                    'best_acc': best_acc,
-                    'learning_rate': optimizer.param_groups[0]['lr'],
-                }, os.path.join(cfg.save_dir, f'{cfg.run_name}_best_epoch{epoch}.pt'))
-                print(f"[VAL] New best @ epoch {epoch}: knn_acc={best_acc:.4f} (saved)")
-            else:
-                no_improve += 1
-                print(f"[VAL] train_loss={train_loss:.4f} (best={best_acc:.4f} @ {best_epoch}) | patience {no_improve}/{cfg.patience}")
-            
-            if _wandb.run is not None:
-                _wandb.log({
-                    "epoch": epoch,
-                    "train_loss": float(train_loss),
-                })
-            
-            logger.log({
-                "val/train_loss": train_loss,
-                "val/best_loss": best_loss,
+        if train_mAP > best_mAP:
+            best_mAP = train_mAP; best_epoch = epoch; no_improve = 0
+            torch.save({
+                'epoch': epoch,
+                'model': backbone.state_dict(),
+                'head': objective.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'seed': cfg.seed,
+                'best_mAP': best_mAP,
+                'learning_rate': optimizer.param_groups[0]['lr'],
+            }, os.path.join(cfg.save_dir, f'{cfg.run_name}_best_epoch{epoch}.pt'))
+            print(f"[VAL] New best @ epoch {epoch}: val_mAP={best_mAP:.4f} (saved)")
+        else:
+            no_improve += 1
+            print(f"[VAL] train_loss={train_loss:.4f} (best={best_mAP:.4f} @ {best_epoch}) | patience {no_improve}/{cfg.patience}")
+        
+        if _wandb.run is not None:
+            _wandb.log({
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "train/mAP": float(train_mAP),
             })
-            if no_improve >= cfg.patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                break
+        
+        logger.log({
+            "epoch": epoch,
+            "train_loss": float(train_loss),
+            "val/mAP": float(train_mAP),
+        })
+        if no_improve >= cfg.patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
 
     torch.save({
         'epoch': epoch,
@@ -563,8 +627,7 @@ def fit(
     }, os.path.join(cfg.save_dir, f'{cfg.run_name}_final.pt'))
     print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
 
-
-    overall, per_dataset_acc = _eval_knn(backbone, ref_eval_set, val_loader, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+    overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
     logger.log({"metrics/overall_acc": overall})
     if logger.active and _wandb is not None:
         table = _wandb.Table(columns=["dataset", "accuracy"])
@@ -655,13 +718,12 @@ def main():
             if k in live:
                 setattr(cfg, k, type(getattr(cfg, k))(live[k]))
 
-        # Build everything from the (possibly) overridden cfg
         data = DataBuilder(cfg)
-        train_set, ref_eval_set, val_set, train_loader, ref_eval_loader, val_loader = data.build()
+        loaders, datasets = data.build()
 
         mb = ModelBuilder(cfg)
         backbone, emb_dim, manifold = mb.build()
-        num_classes = train_set.num_classes
+        num_classes = datasets["train"].num_classes
         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
 
         ob = OptimBuilder(cfg)
@@ -671,7 +733,7 @@ def main():
         backbone = backbone.to(device); objective = objective.to(device)
 
         # Train
-        fit(cfg, backbone, objective, train_loader, val_loader, optimizer, scheduler,
-            ref_eval_loader, device, wb, emb_dim, manifold)
+        fit(cfg, backbone, objective, loaders, optimizer, scheduler,
+            device, wb, emb_dim, manifold)
 if __name__ == '__main__':
     main()
