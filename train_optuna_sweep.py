@@ -245,7 +245,6 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
         except optuna.exceptions.TrialPruned:
             raise
 
-        overall, _ = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
         return best_mAP
 
 
@@ -622,13 +621,12 @@ def train_one_epoch(
                 metric_count += 1
                 if _wandb.run is not None:
                     _wandb.log({
-                        "train/val_mAP": mAP,
-                        "train/val_top1": acc1,
-                        "train/val_top5": acc5,
-                        "train/val_top10": acc10,
-                        "train/iter": epoch * steps_per_epoch + i + 1,
-                        "epoch": epoch,
-                    })
+                        "train_loop/val_mAP": mAP,
+                        "train_loop/val_top1": acc1,
+                        "train_loop/val_top5": acc5,
+                        "train_loop/val_top10": acc10,
+                        "train_loop/iter": epoch * steps_per_epoch + i + 1,
+                    }, step=epoch * steps_per_epoch + i + 1)
                 else:
                     print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
                         f"| loss {float(running_loss)/(i+1):.4f} | val_mAP {mAP:.4f} | val_top1 {acc1:.4f} | val_top5 {acc5:.4f} | val_top10 {acc10:.4f}")
@@ -690,10 +688,10 @@ def fit(
         
         if _wandb.run is not None:
             _wandb.log({
-                "epoch": epoch,
-                "train_loss": float(train_loss),
+                "train/epoch": epoch,
+                "train/train_loss": float(train_loss),
                 "train/_epoch_mAP": float(train_mAP),
-            })
+            },step=epoch)
         if trial is not None:
             trial.report(train_mAP, step=epoch)
             if trial.should_prune():
@@ -838,7 +836,7 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         backbone = backbone.to(device); objective = objective.to(device)
 
-        fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, emb_dim, manifold)
+        _ = fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, emb_dim, manifold)
 
 
 
