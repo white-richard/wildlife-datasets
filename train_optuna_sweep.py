@@ -11,8 +11,10 @@ You can add new paradigms without touching the main training loop.
 
 This file keeps your original custom dependencies but isolates them behind builders.
 
+Starts a PostgreSQL server for Optuna with:
+sudo docker run -d --name optuna-pg -e POSTGRES_PASSWORD=optuna   -e POSTGRES_USER=optuna -e POSTGRES_DB=wr10k   -p 5432:5432 postgres:15
 
-python train_mega_descriptor.py \
+python train_optuna_sweep.py \
   --tune-trials -1 \
   --tune-direction maximize \
   --tune-storage postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k \
@@ -42,6 +44,10 @@ from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm, trange
 import wandb as _wandb
 import optuna
+optuna.delete_study(
+    study_name="wr10k_sweep",
+    storage="postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k",
+)
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
 
@@ -63,8 +69,6 @@ from knn_per_class import evaluate_knn1
 from hyp_knn_per_class import evaluate_knn1 as hyp_evaluate_knn1
 from wandb_session import WandbSession, WandbMode
 from augmentations import AugCfg, build_train_tfms
-from knn_val_monitor import MemoryBankQueue, knn_top1_on_batch
-from hyp_knn_val_monitor import knn_top1_on_batch_lorentz as hyp_knn_top1_on_batch, MemoryBankQueue as HypMemoryBankQueue
 from reid_split_wr10k import build_reid_pipeline
 from validation import validate_split
 
@@ -131,15 +135,6 @@ class Config:
     # logging
     wandb_mode: WandbMode = WandbMode.OFF
     project: str = "reproduce_mega_descriptor"
-
-class LorentzEmbToTangent(nn.Module):
-    def __init__(self, manifold):
-        super().__init__()
-        self.manifold = manifold
-
-    def forward(self, x):
-        v = self.manifold.logmap0(x)
-        return v[..., 1:]
 
 
 def init_weights_xavier(m):
@@ -399,7 +394,6 @@ class ModelBuilder:
                 out = backbone(dummy)
             backbone.train()
             emb_dim = out.shape[1]
-            # backbone = nn.Sequential(backbone, LorentzEmbToTangent(manifold))
 
         elif model_name == 'megadescriptor_swin':
             backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-B-224', num_classes=0, pretrained=False)
@@ -681,7 +675,7 @@ def fit(
             _wandb.log({
                 "epoch": epoch,
                 "train_loss": float(train_loss),
-                "train/mAP": float(train_mAP),
+                "train/_epoch_mAP": float(train_mAP),
             })
         if trial is not None:
             trial.report(train_mAP, step=epoch)
@@ -829,38 +823,6 @@ def main():
         fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, emb_dim, manifold)
 
 
-# def main():
-#     cfg = _parse_args()
-#     set_seed(cfg.seed)
-#     # Open W&B first so sweep values are available
-#     with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
-#         live = wb.cfg  # this is wandb.config (sweep values if present)
-#         # allow-list of keys we accept from sweeps
-#         for k in [
-#             "lr","wd","epochs","train_batch","eval_batch","img_size",
-#             "accumulation_steps","use_amp","val_interval","patience","optimizer_name",
-#             "aug_policy"
-#         ]:
-#             if k in live:
-#                 setattr(cfg, k, type(getattr(cfg, k))(live[k]))
-
-#         data = DataBuilder(cfg)
-#         loaders, datasets = data.build()
-
-#         mb = ModelBuilder(cfg)
-#         backbone, emb_dim, manifold = mb.build()
-#         num_classes = datasets["train"].num_classes
-#         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
-
-#         ob = OptimBuilder(cfg)
-#         optimizer, scheduler = ob.build(backbone, objective, manifold)
-
-#         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#         backbone = backbone.to(device); objective = objective.to(device)
-
-#         # Train
-#         fit(cfg, backbone, objective, loaders, optimizer, scheduler,
-#             device, wb, emb_dim, manifold)
 
 if __name__ == '__main__':
     main()
