@@ -10,9 +10,20 @@ Training paradigms are pluggable via a simple Strategy registry (see `TrainingPa
 You can add new paradigms without touching the main training loop.
 
 This file keeps your original custom dependencies but isolates them behind builders.
+
+
+
+python train_mega_descriptor.py \
+  --tune-trials -1 \
+  --tune-direction maximize \
+  --tune-storage postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k \
+  --tune-study wr10k_sweep \
+  --wandb online --project reproduce_mega_descriptor_optuna
+
 """
 from __future__ import annotations
 import os
+import copy
 import random
 import argparse
 from dataclasses import dataclass, asdict
@@ -30,6 +41,9 @@ import timm
 from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm, trange
 import wandb as _wandb
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
 
 from wildlife_tools.train.objective import ArcFaceLoss
 from wildlife_datasets.datasets import WildlifeReID10k
@@ -100,11 +114,18 @@ class Config:
     lr_min: float = 1e-6
     optimizer_name: str = "sgd"  # sgd | adam
 
+    tune_trials: int = 0              # 0 = no tuning; >0 runs optuna
+    tune_direction: str = "maximize"  # "maximize" mAP
+    tune_storage: Optional[str] = None  # e.g. "sqlite:///wr10k_optuna.db"
+    tune_study: Optional[str] = None    # study name if you want persistence
+    tune_pruner: str = "hyperband"       # median | sha | hyperband | none
+    tune_sampler: str = "tpe"         # currently only tpe wired
+
     # training loop
     accumulation_steps: int = 1
     use_amp: bool = False
     val_interval: int = 1
-    patience: int = 15
+    patience: int = 10
 
     # logging
     wandb_mode: WandbMode = WandbMode.OFF
@@ -165,6 +186,98 @@ def remove_curvature_from_optimizer(optimizer, manifold) -> None:
         if id(p) in remove_ids:
             optimizer.state.pop(p, None)
             print(f"Dropped curvature param {p} from optimizer.")
+
+def suggest_params(trial: "optuna.trial.Trial", base_cfg: Config) -> Dict[str, object]:
+    params = {
+        "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-3, log=True),
+        "epochs": trial.suggest_int("epochs", 10, 60, step=10),
+        "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
+        "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
+        "aug_policy": trial.suggest_categorical("aug_policy", ["baseline","weak","strong","randaug","augmix"]),
+    }
+    return params
+
+def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
+    cfg = copy.deepcopy(base_cfg)
+
+    suggested = suggest_params(trial, cfg)
+    for k, v in suggested.items():
+        setattr(cfg, k, type(getattr(cfg, k))(v))
+
+    cfg.run_name = f"{base_cfg.run_name}-t{trial.number}"
+
+    if _wandb.run is not None:
+        _wandb.config.update(suggested, allow_val_change=True)
+
+    set_seed(cfg.seed)
+    with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
+        data = DataBuilder(cfg)
+        loaders, datasets = data.build()
+
+        mb = ModelBuilder(cfg)
+        backbone, emb_dim, manifold = mb.build()
+        num_classes = datasets["train"].num_classes
+        objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
+
+        ob = OptimBuilder(cfg)
+        optimizer, scheduler = ob.build(backbone, objective, manifold)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        backbone = backbone.to(device); objective = objective.to(device)
+
+        try:
+            best_mAP = fit(cfg, backbone, objective, loaders, optimizer, scheduler,
+                device, wb, emb_dim, manifold, trial=trial)
+        except optuna.exceptions.TrialPruned:
+            raise
+
+        overall, _ = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+        return best_mAP
+
+
+def run_optuna(cfg: Config):
+    if optuna is None:
+        raise RuntimeError("optuna is not installed. pip install optuna")
+
+    if cfg.tune_sampler == "tpe":
+        sampler = TPESampler(seed=cfg.seed)
+    else:
+        sampler = TPESampler(seed=cfg.seed)
+
+    # pruner
+    pruner_map = {
+        "median": MedianPruner(n_warmup_steps=3),
+        "sha": SuccessiveHalvingPruner(),
+        "hyperband": HyperbandPruner(),
+        "none": None,
+    }
+    pruner = pruner_map[cfg.tune_pruner]
+
+    study = optuna.create_study(
+        direction=cfg.tune_direction,
+        sampler=sampler,
+        pruner=pruner,
+        storage=cfg.tune_storage,
+        study_name=cfg.tune_study,
+        load_if_exists=bool(cfg.tune_storage and cfg.tune_study),
+    )
+    if isinstance(study._storage, optuna.storages._rdb.storage.RDBStorage):
+        study._storage._heartbeat_interval = 60  # seconds
+        study._storage._fail_stale_trials = True
+
+
+    def _objective(trial: optuna.trial.Trial):
+        return _run_one_trial(trial, cfg)
+
+    # study.optimize(_objective, n_trials=cfg.tune_trials, show_progress_bar=True)
+    n_trials = None if cfg.tune_trials < 0 else cfg.tune_trials
+    study.optimize(_objective, n_trials=n_trials, show_progress_bar=True)
+
+
+    print(f"[Optuna] Best value={study.best_value:.6f}")
+    print(f"[Optuna] Best params={study.best_trial.params}")
+    return study
 
 
 # ------------------------------------------------------------------------------------------------
@@ -443,8 +556,6 @@ def train_one_epoch(
     device: str = "cuda",
     use_amp: bool = False,
     paradigm: TrainingParadigm | None = None,
-    train_set: WR10kDataset | None = None,
-    bank: MemoryBankQueue | None = None,
     hyperbolic: bool = False,
 ):
     train_loader = loaders['train']
@@ -494,7 +605,7 @@ def train_one_epoch(
                 mAP = metrics['mAP']
                 acc1 = metrics['top1']
                 acc5 = metrics['top5']
-                acc10 = metrics['top1']
+                acc10 = metrics['top10']
                 running_metric += mAP
                 metric_count += 1
                 if _wandb.run is not None:
@@ -510,36 +621,6 @@ def train_one_epoch(
                     print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
                         f"| loss {float(running_loss)/(i+1):.4f} | val_mAP {mAP:.4f} | val_top1 {acc1:.4f} | val_top5 {acc5:.4f} | val_top10 {acc10:.4f}")
         
-        # if (i % 10 == 0) or (i == steps_per_epoch - 1):
-        #     with torch.no_grad():
-        #         # only compute if we have any valid labels (-1 means empty)
-        #         _, y_bank = bank.tensors()
-        #         if y_bank is not None and (y_bank != -1).any():
-        #             if hyperbolic:
-        #                 acc = hyp_knn_top1_on_batch(
-        #                     feats.detach(), y, bank,
-        #                     k=3, T=0.07, num_classes=train_set.num_classes 
-        #                 )
-        #                 running_acc += acc
-        #                 acc_count += 1
-        #             else:
-        #                 acc = knn_top1_on_batch(
-        #                     feats.detach(), y, bank,
-        #                     k=3, T=0.07, num_classes=train_set.num_classes  
-        #                 )
-        #                 running_acc += acc
-        #                 acc_count += 1
-        #             if _wandb.run is not None:
-        #                 _wandb.log({
-        #                     "train/knn@3": acc,
-        #                     "train/iter": epoch * steps_per_epoch + i + 1,
-        #                     "epoch": epoch,
-        #                 })
-        #             else:
-        #                 print(f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
-        #                     f"| loss {float(running_loss)/(i+1):.4f} | knn@3 {acc:.4f}")
-
-        # bank.enqueue(feats.detach(), y)  # add to memory bank
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}",)
     avg_acc = float(running_metric) / metric_count if metric_count > 0 else float("nan")
     return float(running_loss) / steps_per_epoch, avg_acc
@@ -555,6 +636,7 @@ def fit(
     logger: WandbSession,
     emb_dim: int,
     manifold=None,
+    trial: "optuna.trial.Trial | None" = None,
 ):
     os.makedirs(cfg.save_dir, exist_ok=True)
     best_loss = float('inf')
@@ -568,16 +650,11 @@ def fit(
     paradigm = TrainingParadigm.REGISTRY[cfg.loss_type]
     scaler = amp.GradScaler('cuda', enabled=cfg.use_amp)
 
-    if cfg.hyperbolic:
-        bank = HypMemoryBankQueue(manifold, K=5000, feat_dim=emb_dim, store_labels=True, device=device)
-    else:
-        bank = MemoryBankQueue(K=5000, feat_dim=emb_dim, store_labels=True, device=device)
-
     for epoch in trange(1, cfg.epochs + 1, desc="Epochs"):
         train_loss, train_mAP = train_one_epoch(
             backbone, objective, loaders, optimizer, epoch,
             scaler=scaler, accumulation_steps=cfg.accumulation_steps, device=str(device),
-            use_amp=cfg.use_amp, paradigm=paradigm, bank=bank,
+            use_amp=cfg.use_amp, paradigm=paradigm,
             hyperbolic=cfg.hyperbolic,
         )
         scheduler.step(epoch + 1)
@@ -605,6 +682,12 @@ def fit(
                 "train_loss": float(train_loss),
                 "train/mAP": float(train_mAP),
             })
+        if trial is not None:
+            trial.report(train_mAP, step=epoch)
+            if trial.should_prune():
+                if _wandb.run is not None:
+                    _wandb.summary["pruned_at_epoch"] = epoch
+                raise optuna.exceptions.TrialPruned()
         
         logger.log({
             "epoch": epoch,
@@ -638,6 +721,8 @@ def fit(
         logger.log({"plots/per_dataset_accuracy": _wandb.plot.bar(table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy")})
     else:
         print(f"Overall acc: {overall}.")
+    
+    return best_mAP
 
 
 def _parse_args() -> Config:
@@ -673,6 +758,13 @@ def _parse_args() -> Config:
     p.add_argument('--wandb', type=str, default=Config.wandb_mode.value, choices=[m.value for m in WandbMode])
     p.add_argument('--project', type=str, default=Config.project)
 
+    p.add_argument('--tune-trials', type=int, default=Config.tune_trials)
+    p.add_argument('--tune-direction', type=str, default=Config.tune_direction, choices=['minimize','maximize'])
+    p.add_argument('--tune-storage', type=str, default=Config.tune_storage)
+    p.add_argument('--tune-study', type=str, default=Config.tune_study)
+    p.add_argument('--tune-pruner', type=str, default=Config.tune_pruner, choices=['median','sha','hyperband','none'])
+    p.add_argument('--tune-sampler', type=str, default=Config.tune_sampler, choices=['tpe'])
+
     args = p.parse_args()
     cfg = Config(
         run_name=args.run_name,
@@ -699,25 +791,24 @@ def _parse_args() -> Config:
         wandb_mode=WandbMode(args.wandb),
         project=args.project,
         optimizer_name=args.optimizer_name,
+        tune_trials=args.tune_trials,
+        tune_direction=args.tune_direction,
+        tune_storage=args.tune_storage,
+        tune_study=args.tune_study,
+        tune_pruner=args.tune_pruner,
+        tune_sampler=args.tune_sampler,
     )
     return cfg
 
-
+# CHANGE: rewrite main() tail
 def main():
     cfg = _parse_args()
-    set_seed(cfg.seed)
-    # Open W&B first so sweep values are available
-    with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
-        live = wb.cfg  # this is wandb.config (sweep values if present)
-        # allow-list of keys we accept from sweeps
-        for k in [
-            "lr","wd","epochs","train_batch","eval_batch","img_size",
-            "accumulation_steps","use_amp","val_interval","patience","optimizer_name",
-            "aug_policy"
-        ]:
-            if k in live:
-                setattr(cfg, k, type(getattr(cfg, k))(live[k]))
+    if cfg.tune_trials and cfg.tune_trials > 0:
+        run_optuna(cfg)
+        return
 
+    set_seed(cfg.seed)
+    with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
         data = DataBuilder(cfg)
         loaders, datasets = data.build()
 
@@ -732,8 +823,41 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         backbone = backbone.to(device); objective = objective.to(device)
 
-        # Train
-        fit(cfg, backbone, objective, loaders, optimizer, scheduler,
-            device, wb, emb_dim, manifold)
+        fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, emb_dim, manifold)
+
+
+# def main():
+#     cfg = _parse_args()
+#     set_seed(cfg.seed)
+#     # Open W&B first so sweep values are available
+#     with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
+#         live = wb.cfg  # this is wandb.config (sweep values if present)
+#         # allow-list of keys we accept from sweeps
+#         for k in [
+#             "lr","wd","epochs","train_batch","eval_batch","img_size",
+#             "accumulation_steps","use_amp","val_interval","patience","optimizer_name",
+#             "aug_policy"
+#         ]:
+#             if k in live:
+#                 setattr(cfg, k, type(getattr(cfg, k))(live[k]))
+
+#         data = DataBuilder(cfg)
+#         loaders, datasets = data.build()
+
+#         mb = ModelBuilder(cfg)
+#         backbone, emb_dim, manifold = mb.build()
+#         num_classes = datasets["train"].num_classes
+#         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold)
+
+#         ob = OptimBuilder(cfg)
+#         optimizer, scheduler = ob.build(backbone, objective, manifold)
+
+#         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#         backbone = backbone.to(device); objective = objective.to(device)
+
+#         # Train
+#         fit(cfg, backbone, objective, loaders, optimizer, scheduler,
+#             device, wb, emb_dim, manifold)
+
 if __name__ == '__main__':
     main()

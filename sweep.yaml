@@ -22,5 +22,11 @@ command:
   - ${program}
   - --wandb
   - sweep
-  - --run-name
-  - sweep-${trial_id}-aug_policy
+  - --lr
+  - 0.00005881435843725898
+  - --wd
+  - 0.0001
+  - --epochs
+  - 40
+  - --optimizer-name
+  - sgd
