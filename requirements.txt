@@ -7,3 +7,5 @@ tqdm
 wandb
 pytorch-metric-learning
 torch-scatter
+optuna
+optuna-dashboard

@@ -12,13 +12,12 @@ You can add new paradigms without touching the main training loop.
 This file keeps your original custom dependencies but isolates them behind builders.
 
 
-
 python train_mega_descriptor.py \
   --tune-trials -1 \
   --tune-direction maximize \
   --tune-storage postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k \
   --tune-study wr10k_sweep \
-  --wandb online --project reproduce_mega_descriptor_optuna
+  --wandb online --project reproduce_mega_descriptor
 
 """
 from __future__ import annotations
@@ -93,7 +92,7 @@ class Config:
     save_dir: str = "checkpoints"
 
     # data
-    root: str = "/home/richw/.richie/repos/wildlifereid-10k"
+    root: str = "../wildlifereid-10k"
     img_size: int = 224
     num_workers: int = 16
     train_batch: int = 128
