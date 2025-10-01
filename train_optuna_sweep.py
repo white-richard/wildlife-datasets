@@ -217,13 +217,13 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
 
     cfg.run_name = f"{base_cfg.run_name}-t{trial.number}"
 
-    if _wandb.run is not None:
-        _wandb.config.update(suggested, allow_val_change=True)
-
     set_seed(cfg.seed)
     with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
         data = DataBuilder(cfg)
         loaders, datasets = data.build()
+        
+        if _wandb.run is not None:
+            _wandb.config.update(suggested, allow_val_change=True)
 
         mb = ModelBuilder(cfg)
         backbone, emb_dim, manifold = mb.build()

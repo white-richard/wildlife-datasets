@@ -9,3 +9,4 @@ pytorch-metric-learning
 torch-scatter
 optuna
 optuna-dashboard
+psycopg2-binary
