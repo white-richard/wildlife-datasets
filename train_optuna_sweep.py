@@ -12,12 +12,21 @@ You can add new paradigms without touching the main training loop.
 This file keeps your original custom dependencies but isolates them behind builders.
 
 Starts a PostgreSQL server for Optuna with:
-sudo docker run -d --name optuna-pg -e POSTGRES_PASSWORD=optuna   -e POSTGRES_USER=optuna -e POSTGRES_DB=wr10k   -p 5432:5432 postgres:15
+docker container stop optuna-pg
+docker container rm optuna-pg
+
+docker run -d --name optuna-pg \
+  -e POSTGRES_USER=optuna \
+  -e POSTGRES_PASSWORD=optuna-pg \
+  -e POSTGRES_DB=wr10k \
+  -v optuna_pgdata:/var/lib/postgresql/data \
+  -p 100.113.213.2:5432:5432 \
+  postgres:15
 
 python train_optuna_sweep.py \
   --tune-trials -1 \
   --tune-direction maximize \
-  --tune-storage postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k \
+  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k \
   --tune-study wr10k_sweep \
   --wandb online --project reproduce_mega_descriptor \
   --tune-seed 42
@@ -44,10 +53,15 @@ from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm, trange
 import wandb as _wandb
 import optuna
-optuna.delete_study(
-    study_name="wr10k_sweep",
-    storage="postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k",
-)
+
+try:
+    name = "wr10k_sweep"
+    
+    storage = 'postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k'
+    optuna.delete_study(study_name=name, storage=storage)
+    print(f"Deleted study: {name}")
+except KeyError:
+    print(f"Study not found, nothing to delete: {name}")
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
 
