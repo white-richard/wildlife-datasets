@@ -54,14 +54,6 @@ from tqdm import tqdm, trange
 import wandb as _wandb
 import optuna
 
-try:
-    name = "wr10k_sweep"
-    
-    storage = 'postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k'
-    optuna.delete_study(study_name=name, storage=storage)
-    print(f"Deleted study: {name}")
-except KeyError:
-    print(f"Study not found, nothing to delete: {name}")
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
 
@@ -213,7 +205,13 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
 
     suggested = suggest_params(trial, cfg)
     for k, v in suggested.items():
-        setattr(cfg, k, type(getattr(cfg, k))(v))
+        # setattr(cfg, k, type(getattr(cfg, k))(v))
+        def _coerce(val, target):
+            return bool(val) if isinstance(target, bool) else type(target)(val)
+
+        for k, v in suggested.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, _coerce(v, getattr(cfg, k)))
 
     cfg.run_name = f"{base_cfg.run_name}-t{trial.number}"
 
@@ -221,9 +219,14 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
     with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
         data = DataBuilder(cfg)
         loaders, datasets = data.build()
-        
+
         if _wandb.run is not None:
-            _wandb.config.update(suggested, allow_val_change=True)
+            _wandb.config.update({
+            "optuna/study": cfg.tune_study,
+            "optuna/trial_number": trial.number,
+            "optuna/seed_effective": cfg.tune_seed,
+        }, allow_val_change=True)
+        _wandb.summary["effective_config"] = {k: getattr(cfg, k) for k in suggest_params(trial, cfg).keys()}
 
         mb = ModelBuilder(cfg)
         backbone, emb_dim, manifold = mb.build()
@@ -251,9 +254,9 @@ def run_optuna(cfg: Config):
         raise RuntimeError("optuna is not installed. pip install optuna")
 
     if cfg.tune_sampler == "tpe":
-        sampler = TPESampler(seed=cfg.seed)
+        sampler = TPESampler(seed=cfg.tune_seed)
     else:
-        sampler = TPESampler(seed=cfg.seed)
+        sampler = TPESampler(seed=cfg.tune_seed)
 
     # pruner
     pruner_map = {
@@ -807,14 +810,15 @@ def _parse_args() -> Config:
         tune_study=args.tune_study,
         tune_pruner=args.tune_pruner,
         tune_sampler=args.tune_sampler,
-        tune_seed=args.seed,
+        tune_seed=args.tune_seed,
     )
     return cfg
 
 # CHANGE: rewrite main() tail
 def main():
     cfg = _parse_args()
-    if cfg.tune_trials and cfg.tune_trials > 0:
+    if cfg.tune_trials != 0:
+        print(f"Running Optuna sweep with {cfg.tune_trials} trials.")
         run_optuna(cfg)
         return
 
