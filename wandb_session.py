@@ -24,7 +24,7 @@ class WandbSession:
             print("[WARN] wandb not installed; continuing without logging.")
             return self
         # For sweeps, wandb agent will pass a config; we merge ours as defaults
-        self.run = _wandb.init(project=self.project, name=self.name, config=self.config, reinit=True)
+        self.run = _wandb.init(project=self.project, config=self.config, reinit=True)
         self.active = True
         return self
 

@@ -17,7 +17,8 @@ python train_mega_descriptor.py \
   --tune-direction maximize \
   --tune-storage postgresql+psycopg2://optuna:optuna@100.90.126.94:5432/wr10k \
   --tune-study wr10k_sweep \
-  --wandb online --project reproduce_mega_descriptor
+  --wandb online --project reproduce_mega_descriptor \
+  --tune-seed 42
 
 """
 from __future__ import annotations
@@ -119,6 +120,7 @@ class Config:
     tune_study: Optional[str] = None    # study name if you want persistence
     tune_pruner: str = "hyperband"       # median | sha | hyperband | none
     tune_sampler: str = "tpe"         # currently only tpe wired
+    tune_seed: int = 42
 
     # training loop
     accumulation_steps: int = 1
@@ -763,6 +765,7 @@ def _parse_args() -> Config:
     p.add_argument('--tune-study', type=str, default=Config.tune_study)
     p.add_argument('--tune-pruner', type=str, default=Config.tune_pruner, choices=['median','sha','hyperband','none'])
     p.add_argument('--tune-sampler', type=str, default=Config.tune_sampler, choices=['tpe'])
+    p.add_argument('--tune-seed', type=int, default=Config.tune_seed)
 
     args = p.parse_args()
     cfg = Config(
@@ -796,6 +799,7 @@ def _parse_args() -> Config:
         tune_study=args.tune_study,
         tune_pruner=args.tune_pruner,
         tune_sampler=args.tune_sampler,
+        tune_seed=args.seed,
     )
     return cfg
 
