@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from wildlife_datasets.datasets import WildlifeReID10k
 from wildlife_datasets import splits
-from wr10k_dataset import WR10kDataset
+from .wr10k_dataset import WR10kDataset
 
 
 # Assumed available from your codebase:

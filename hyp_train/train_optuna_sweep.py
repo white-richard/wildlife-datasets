@@ -1,16 +1,4 @@
 """
-Modular WR10k trainer with clean structure and flexible Weights & Biases (W&B) usage.
-
-Supports three modes:
-  - --wandb off      : no W&B imports or logging (safe to run without wandb installed)
-  - --wandb online   : standard wandb.init / wandb.log run
-  - --wandb sweep    : sweep-friendly; hyperparams are pulled from wandb.config if present
-
-Training paradigms are pluggable via a simple Strategy registry (see `TrainingParadigm`).
-You can add new paradigms without touching the main training loop.
-
-This file keeps your original custom dependencies but isolates them behind builders.
-
 Starts a PostgreSQL server for Optuna with:
 docker container stop optuna-pg
 docker container rm optuna-pg
@@ -69,14 +57,14 @@ from hypercore.manifolds.lorentzian import Lorentz
 from hypercore.optimizers import RiemannianSGD, RiemannianAdam
 from hypercore.modules.loss import LorentzTripletLoss
 
-from eucTohyp_Swin import replace_stages_with_hyperbolic
-from wr10k_dataset import WR10kDataset
-from knn_per_class import evaluate_knn1
-from hyp_knn_per_class import evaluate_knn1 as hyp_evaluate_knn1
-from wandb_session import WandbSession, WandbMode
-from augmentations import AugCfg, build_train_tfms
-from reid_split_wr10k import build_reid_pipeline
-from validation import validate_split
+from utils.eucTohyp_Swin import replace_stages_with_hyperbolic
+from utils.wr10k_dataset import WR10kDataset
+from utils.knn_per_class import evaluate_knn1
+from utils.hyp_knn_per_class import evaluate_knn1 as hyp_evaluate_knn1
+from utils.wandb_session import WandbSession, WandbMode
+from utils.augmentations import AugCfg, build_train_tfms
+from hyp_train.utils.reid_split_wr10k import build_reid_pipeline
+from utils.validation import validate_split
 
 
 torch.backends.cudnn.benchmark = True
@@ -109,6 +97,8 @@ class Config:
     train_batch: int = 128
     eval_batch: int = 128
     aug_policy: str = "baseline"  # baseline | weak | strong | randaug | augmix
+    data_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
+    data_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
 
     # model / paradigm
     model_name: str = "megadesc_replace_last_layer_hyperbolic"  # choices below
