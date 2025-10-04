@@ -524,7 +524,8 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(enumerate(train_loader), total=steps_per_epoch, leave=False)
 
-    print("Run name:", _wandb.run.name)
+    if _wandb.run is not None:
+        print("Run name:", _wandb.run.name)
 
     validate_every = max(1, steps_per_epoch - 1)
 
@@ -692,6 +693,8 @@ def fit(
             best_mAP = train_mAP
             best_epoch = epoch
             no_improve = 0
+            save_path=os.path.join(cfg.save_dir, f"{_wandb.run.name}_best_epoch{epoch}.pt")
+            print(f"Saving best checkpoint to {save_path}")
             torch.save(
                 {
                     "epoch": epoch,
@@ -703,7 +706,7 @@ def fit(
                     "best_mAP": best_mAP,
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 },
-                os.path.join(cfg.save_dir, f"{_wandb.run.name}_best_epoch{epoch}.pt"),
+                save_path,
             )
             print(f"[VAL] New best @ epoch {epoch}: val_mAP={best_mAP:.4f} (saved)")
         else:
@@ -741,6 +744,8 @@ def fit(
             print(f"\nEarly stopping at epoch {epoch}")
             break
 
+    save_path=os.path.join(cfg.save_dir, f"{_wandb.run.name}_final.pt")
+    print(f"Saving final checkpoint to {save_path}")
     torch.save(
         {
             "epoch": epoch,
@@ -752,8 +757,9 @@ def fit(
             "best_loss": best_loss,
             "best_epoch": best_epoch,
         },
-        os.path.join(cfg.save_dir, f"{_wandb.run.name}_final.pt"),
+        save_path,
     )
+
     print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
 
     overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
