@@ -60,6 +60,7 @@ from utils.math_utils import kl_rows, pairwise_cosine, softmax_rows
 from utils.reid_split_wr10k import build_reid_pipeline
 from utils.validation import validate_split
 from utils.wandb_session import WandbMode, WandbSession
+from utils.load_checkpoint import load_checkpoint
 
 torch.backends.cudnn.benchmark = True
 
@@ -85,7 +86,9 @@ class Config:
     save_dir: str = "checkpoints"
 
     # data
-    root: str = "../../wildlifereid-10k"
+    root: str = "../../../datasets/wildlifereid-10k"
+    # root: str = "/home/richw/.code/datasets/CzechLynx"
+
     img_size: int = 224
     num_workers: int = 16
     train_batch: int = 96
@@ -95,12 +98,12 @@ class Config:
     data_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     # model / paradigm
-    model_name: str = "megadescriptor_replace_last_layer_hyp"  # choices below
+    model_name: str = "megadescriptor_lastLayer" # megadescriptor_replace_last_layer_hyp  # choices below
     teacher_name: str = "megadescriptor"  # choices below
-    loss_type: str = "triplet"  # arcface | triplet
+    loss_type: str = "arcface"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
     type_of_triplets: str = "semihard"  # all | hard | semihard | easy | None
-    hyperbolic: bool = True
+    hyperbolic: bool = False
 
     # --- KD / Distillation ---
     kd_enable: bool = False  # turn KD on
@@ -198,7 +201,7 @@ def suggest_params(trial: "optuna.trial.Trial", base_cfg: Config) -> Dict[str, o
         # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
         # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
         "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
-        "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
+        # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
     }
     return params
 
@@ -282,6 +285,13 @@ class ModelBuilder:
     def build(self):
         manifold = None
         emb_dim = None
+        def reinit_module(module):
+            for name, p in module.named_parameters():
+                if p.requires_grad:
+                    if p.dim() > 1:
+                        torch.nn.init.xavier_uniform_(p)
+                    else:
+                        torch.nn.init.zeros_(p)
 
         if self.model_name == "hyp_swin":
             if self.pretrained:
@@ -315,6 +325,15 @@ class ModelBuilder:
             emb_dim = backbone.num_features
             if not self.pretrained:
                 backbone.apply(init_weights_xavier)
+        
+        elif self.model_name == "megadescriptor_lastLayer":
+            
+            ViT_size = self.ViT_size[0].upper()
+            backbone = timm.create_model(
+                f"hf-hub:BVRA/MegaDescriptor-{ViT_size}-224", num_classes=0, pretrained=self.pretrained
+            )
+            emb_dim = backbone.num_features
+            reinit_module(backbone.layers[-1])
 
         elif self.model_name == "megadescriptor_replace_last_layer_hyp":
             if self.ViT_size != "base":
@@ -1041,6 +1060,10 @@ def main():
         #                 )
         #             }
         #         )
+        # checkpoint_path = "/home/richw/.code/repos/wildlife-datasets/hyp_train/dandy-darkness-143_best_epoch73.pt"
+        # load_checkpoint(checkpoint_path, backbone)
+        # overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+        # print(f"Overall acc: {overall}.")
 
         _ = fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, manifold, teacher_backbone=teacher_backbone)
 
