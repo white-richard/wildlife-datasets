@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
-from wildlife_datasets.datasets import WildlifeReID10k
+from wildlife_datasets.datasets import WildlifeReID10k, WildlifeDataset
 from wildlife_datasets import splits
 from .wr10k_dataset import WR10kDataset
 
@@ -153,8 +153,56 @@ def build_reid_pipeline(
 ) -> ReIDSplits:
     seed = getattr(cfg, "seed", 42)
 
+    # For lynx dataset
+    # import os
+    # metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
+    # meta = WildlifeDataset(cfg.root, metadata) 
+    # df = _normalize_meta_df(meta.df, cfg.root)
+
     meta = WildlifeReID10k(cfg.root)
     df = meta.df
+    df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+
+#     datasets = 
+#     # List of datasets reported in the WR10k paper
+#     ["AAUZebraFish",
+#     "AerialCattle2017",
+#     "ATRW",
+#     "BelugaID",
+#     "BirdIndividualID",
+#     "CTai" ,
+#     "CZoo",
+#     "Cows2021",
+#     "FriesianCattle2015" ,"FriesianCattle2017" ,
+#     "GiraffeZebraID" ,"Giraffes", "HappyWhale" ,"HumpbackWhaleID" ,"HyenaID2022" ,
+#     "IPanda50", "LeopardID2022" ,"LionData" ,"MacaqueFaces", "NDD20", "NOAARightWhale", "NyalaData", 
+#     "OpenCows2020" ,"SealID","SeaTurtleID" ,"SMALST", "StripeSpotter" ,
+#     "WhaleSharkID", "ZindiTurtleRecall"]
+#     #List of datasets in the WR10k meta dataset
+#     ['AAUZebraFish' 'AerialCattle2017' 'AmvrakikosTurtles' 'ATRW' 'BelugaID'
+#  'BirdIndividualID' 'CatIndividualImages' 'Chicks4FreeID' 'CowDataset'
+#  'Cows2021' 'CTai' 'CZoo' 'DogFaceNet' 'FriesianCattle2015'
+#  'FriesianCattle2017' 'Giraffes' 'GiraffeZebraID' 'HyenaID2022' 'IPanda50'
+#  'LeopardID2022' 'MPDD' 'MultiCamCows2024' 'NDD20' 'NyalaData'
+#  'OpenCows2020' 'PolarBearVidID' 'PrimFace' 'ReunionTurtles' 'SealID'
+#  'SeaStarReID2023' 'SeaTurtleID2022' 'SMALST' 'SouthernProvinceTurtles'
+#  'StripeSpotter' 'WhaleSharkID' 'ZakynthosTurtles' 'ZindiTurtleRecall']
+    # print("Length dataset list:", len(datasets))
+
+    # print(df.head())
+    # print(df.columns)
+    # print(df['dataset'].unique());exit(0)
+
+    # df = df[df['species'] == 'sea turtle']
+    # print(f"Unique datasets used to train: {df['dataset'].unique()} !!!")
+    # print(df.head())
+    # print(df.columns)
+    # print("Total images:", len(df))
+    # print("Unique identities:", df['identity'].nunique())
+    # Filter for multiple species at once, e.g. turtles + beluga_whales
+    # df = df[df['dataset'].isin(datasets)]
+    # print(df['dataset'].nunique());exit(0)
+
 
     # 1) Split identities (unchanged)
     train_ids, test_ids = _split_identities(
@@ -437,3 +485,72 @@ def _safe_train_fit_vs_dev(
             return df_fit, df_dev
 
     return df_work.iloc[0:0].copy(), df_work.iloc[0:0].copy()
+from pathlib import Path
+import pandas as pd
+
+def _normalize_meta_df(df: pd.DataFrame, root: str) -> pd.DataFrame:
+    """
+    Normalize dataset metadata to a consistent WR10k-compatible format.
+
+    Ensures:
+        - 'identity' column exists (renames from 'unique_name' if needed)
+        - 'path' column exists (renames from common variants like 'filepath', etc.)
+        - Paths are made relative to `root` (removes duplicate leading folder names)
+    """
+    df = df.copy()
+    root_path = Path(root)
+    root_name = root_path.name
+
+    # --- 1) Identity column ---
+    if 'identity' not in df.columns:
+        if 'unique_name' in df.columns:
+            df.rename(columns={'unique_name': 'identity'}, inplace=True)
+        else:
+            raise KeyError(
+                f"Missing identity column ('identity' or 'unique_name') in dataframe. "
+                f"Available columns: {list(df.columns)}"
+            )
+
+    # --- 2) Image path column ---
+    if 'path' not in df.columns:
+        path_aliases = ['filepath', 'relpath', 'file_path', 'image_path', 'filename']
+        for alias in path_aliases:
+            if alias in df.columns:
+                df.rename(columns={alias: 'path'}, inplace=True)
+                break
+        if 'path' not in df.columns:
+            raise KeyError(
+                f"Missing image path column: expected one of ['path', 'filepath', 'relpath', "
+                f"'file_path', 'image_path', 'filename']. Found: {list(df.columns)}"
+            )
+
+    # --- 3) Clean up paths so they're relative to `root` ---
+    def _fix_path(p):
+        p = Path(str(p))
+        # Handle absolute paths
+        if p.is_absolute():
+            try:
+                p = p.relative_to(root_path)
+            except ValueError:
+                pass
+        # Handle relative paths with duplicated dataset name (e.g., "CzechLynx/CzechLynx/...") 
+        elif len(p.parts) > 1 and p.parts[0] == root_name:
+            # drop the first folder if it duplicates root
+            if p.parts[1] == root_name:
+                p = Path(*p.parts[1:])
+            else:
+                p = Path(*p.parts[1:])
+        return str(p)
+
+    df['path'] = df['path'].map(_fix_path)
+
+    # --- 4) Type normalization & sanity checks ---
+    df['identity'] = df['identity'].astype(str)
+    df['path'] = df['path'].astype(str)
+
+    if df['path'].isnull().any():
+        raise ValueError("Found missing values in 'path' column after normalization.")
+    if df['identity'].isnull().any():
+        raise ValueError("Found missing values in 'identity' column after normalization.")
+
+    return df
