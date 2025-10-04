@@ -12,6 +12,7 @@ class AugCfg:
 def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
     d = img_size
     if a.policy == "weak":
+        raise
         tfms = [
             T.RandomResizedCrop(d, scale=(max(0.85, a.crop_min_scale), 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(), # need to test if this is ok for wildlife
@@ -19,6 +20,7 @@ def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
             T.Normalize([0.5]*3, [0.5]*3),
         ]
     elif a.policy == "baseline":
+        raise
         tfms = [
             T.RandomResizedCrop(d, scale=(a.crop_min_scale, 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),
@@ -31,6 +33,7 @@ def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
             T.RandomErasing(p=a.erasing_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
         ]
     elif a.policy == "strong":
+        raise
         tfms = [
             T.RandomResizedCrop(d, scale=(max(0.5, a.crop_min_scale), 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),
@@ -43,15 +46,22 @@ def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
             T.RandomErasing(p=min(0.4, a.erasing_p+0.1), scale=(0.02, 0.25), ratio=(0.3, 3.3), value='random', inplace=True),
         ]
     elif a.policy == "randaug":
-        tfms = [
-            T.RandomResizedCrop(d, scale=(a.crop_min_scale, 1.0), interpolation=T.InterpolationMode.BICUBIC),
-            T.RandomHorizontalFlip(),
-            T.RandAugment(num_ops=a.randaug_n, magnitude=a.randaug_m),
+        # tfms = [
+        #     T.RandomResizedCrop(d, scale=(a.crop_min_scale, 1.0), interpolation=T.InterpolationMode.BICUBIC),
+        #     T.RandomHorizontalFlip(),
+        #     T.RandAugment(num_ops=a.randaug_n, magnitude=a.randaug_m),
+        #     T.ToTensor(),
+        #     T.Normalize([0.5]*3, [0.5]*3),
+        #     T.RandomErasing(p=a.erasing_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
+        # ]
+        tfms = T.Compose([
+            T.RandomResizedCrop(size=(d, d), scale=(0.8, 1.0)),
+            T.RandAugment(num_ops=2, magnitude=20),
             T.ToTensor(),
-            T.Normalize([0.5]*3, [0.5]*3),
-            T.RandomErasing(p=a.erasing_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
-        ]
+            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
     elif a.policy == "augmix":
+        raise
         tfms = [
             T.RandomResizedCrop(d, scale=(a.crop_min_scale, 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),

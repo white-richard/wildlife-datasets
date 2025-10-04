@@ -11,12 +11,12 @@ docker run -d --name optuna-pg \
   -p 100.113.213.2:5432:5432 \
   postgres:15
 
-python train_optuna_sweep.py \
+python train_optuna_sweep_distill.py \
   --tune-trials -1 \
   --tune-direction maximize \
   --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k \
-  --tune-study wr10k_sweep \
-  --wandb online --project reproduce_mega_descriptor \
+  --tune-study turtlr_sweep \
+  --wandb online --project turtle_reid \
   --tune-seed 42
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ import torchvision.transforms as T
 import wandb as _wandb
 from geoopt import ManifoldParameter
 from hypercore.manifolds.lorentzian import Lorentz
-from hypercore.models.Swin_LViT import LSwin_base, LSwin_small
+from hypercore.models.Swin_LViT import LSwin_base, LSwin_small, LSwin_tiny
 from hypercore.modules.loss import LorentzTripletLoss
 from hypercore.optimizers import RiemannianAdam, RiemannianSGD
 import hypercore.nn as hnn
@@ -80,18 +80,18 @@ def set_seed(seed: int = 0) -> None:
 @dataclass
 class Config:
     # run meta
-    run_name: str = "wr10k_megadesc_arcface"
+    run_name: str = "wr10k_megadesc_distill"
     seed: int = 42
     save_dir: str = "checkpoints"
 
     # data
     root: str = "../../wildlifereid-10k"
     img_size: int = 224
-    num_workers: int = 16
-    train_batch: int = 64
+    num_workers: int = 8
+    train_batch: int = 32
     eval_batch: int = 128
-    aug_policy: str = "baseline"  # baseline | weak | strong | randaug | augmix
-    data_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    aug_policy: str = "randaug"  # baseline | weak | strong | randaug | augmix
+    data_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406) # NOT IMPLEMENTED
     data_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     # model / paradigm
@@ -129,14 +129,16 @@ class Config:
     tune_seed: int = 42
 
     # training loop
-    accumulation_steps: int = 2
+    accumulation_steps: int = 4
     use_amp: bool = False
     val_interval: int = 1
-    patience: int = 10
+    patience: int = 15
+    use_scheduler: bool = False
+    print("Using scheduler:", use_scheduler)
 
     # logging
     wandb_mode: WandbMode = WandbMode.OFF
-    project: str = "reproduce_mega_descriptor"
+    project: str = "turtle_reid"
 
 
 def init_weights_xavier(m):
@@ -189,7 +191,7 @@ def remove_curvature_from_optimizer(optimizer, manifold) -> None:
 def suggest_params(trial: "optuna.trial.Trial", base_cfg: Config) -> Dict[str, object]:
     params = {
         "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
-        "wd": trial.suggest_float("wd", 1e-6, 1e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
         "epochs": trial.suggest_int("epochs", 10, 60, step=10),
         # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
         "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
@@ -286,6 +288,8 @@ class ModelBuilder:
                 backbone = LSwin_base(manifold, manifold, manifold, num_classes=0, embed_dim=48 + 1)
             elif self.ViT_size == "small":
                 backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
+            elif self.ViT_size == "tiny":
+                backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
             else:
                 raise ValueError(f"Unsupported ViT_size {self.ViT_size} for hyperbolic swin")
             for p in backbone.parameters():
@@ -358,6 +362,7 @@ class ObjectiveBuilder:
 class OptimBuilder:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.use_scheduler = cfg.use_scheduler
 
     def build(self, backbone: nn.Module, head: nn.Module, manifold=None):
         wd = self.cfg.wd
@@ -406,15 +411,18 @@ class OptimBuilder:
         # Cosine schedule in epochs
         for g in optimizer.param_groups:
             g.setdefault("initial_lr", g["lr"])
-        scheduler = CosineLRScheduler(
-            optimizer,
-            t_initial=self.cfg.epochs,
-            lr_min=self.cfg.lr_min,
-            warmup_lr_init=self.cfg.lr_min,
-            warmup_t=self.cfg.warmup_t,
-            cycle_limit=1,
-            t_in_epochs=True,
-        )
+        
+        scheduler = None
+        if self.use_scheduler:
+            scheduler = CosineLRScheduler(
+                optimizer,
+                t_initial=self.cfg.epochs,
+                lr_min=self.cfg.lr_min,
+                warmup_lr_init=self.cfg.lr_min,
+                warmup_t=self.cfg.warmup_t,
+                cycle_limit=1,
+                t_in_epochs=True,
+            )
         return optimizer, scheduler
 
 
@@ -517,6 +525,7 @@ def train_one_epoch(
     metric_count = 0
 
     manifold = model.manifold if hyperbolic else None
+    wandb_step_name = 'train_loop/iter'
 
     if paradigm is None:
         raise ValueError("Training paradigm must be provided")
@@ -586,6 +595,11 @@ def train_one_epoch(
                 running_metric += mAP
                 metric_count += 1
                 if _wandb.run is not None:
+                    _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/val_mAP")
+                    _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/val_top1")
+                    _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/val_top5")
+                    _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/val_top10") 
+                    # _wandb.define_metric(step_metric = wandb_step, name = "train_loop/iter")
                     _wandb.log(
                         {
                             "train_loop/val_mAP": mAP,
@@ -594,7 +608,6 @@ def train_one_epoch(
                             "train_loop/val_top10": acc10,
                             "train_loop/iter": epoch * steps_per_epoch + i + 1,
                         },
-                        step=epoch * steps_per_epoch + i + 1,
                     )
                 else:
                     print(
@@ -604,9 +617,13 @@ def train_one_epoch(
 
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
         if _wandb.run is not None and cfg is not None and cfg.kd_enable and cfg.kd_weight_pkt > 0.0:
+            _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/loss_pkt")
+
             _wandb.log(
-                {"train_loop/loss_pkt": float(loss_pkt.detach().cpu())},
-                step=epoch * steps_per_epoch + i + 1,
+                {
+                    "train_loop/loss_pkt": float(loss_pkt.detach().cpu()),
+                    "train_loop/iter": epoch * steps_per_epoch + i + 1,
+                },
             )
 
     avg_acc = float(running_metric) / metric_count if metric_count > 0 else float("nan")
@@ -638,6 +655,8 @@ def fit(
     paradigm = TrainingParadigm.REGISTRY[cfg.loss_type]
     scaler = amp.GradScaler(enabled=cfg.use_amp)
 
+    global_step = 0
+
     for epoch in trange(1, cfg.epochs + 1, desc="Epochs"):
         train_loss, train_mAP = train_one_epoch(
             backbone,
@@ -654,7 +673,8 @@ def fit(
             teacher=teacher_backbone,
             cfg=cfg,
         )
-        scheduler.step(epoch + 1)
+        if scheduler is not None:
+            scheduler.step(epoch + 1)
 
         if train_mAP > best_mAP:
             best_mAP = train_mAP
@@ -666,7 +686,7 @@ def fit(
                     "model": backbone.state_dict(),
                     "head": objective.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
                     "seed": cfg.seed,
                     "best_mAP": best_mAP,
                     "learning_rate": optimizer.param_groups[0]["lr"],
@@ -681,13 +701,15 @@ def fit(
             )
 
         if _wandb.run is not None:
+            wandb_step_name = 'train/epoch'
+            _wandb.define_metric(step_metric = wandb_step_name, name = "train/train_loss")
+            _wandb.define_metric(step_metric = wandb_step_name, name = "train/_epoch_mAP")
             _wandb.log(
                 {
                     "train/epoch": epoch,
                     "train/train_loss": float(train_loss),
                     "train/_epoch_mAP": float(train_mAP),
                 },
-                step=epoch,
             )
         if trial is not None:
             trial.report(train_mAP, step=epoch)
@@ -713,7 +735,7 @@ def fit(
             "model": backbone.state_dict(),
             "head": objective.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "seed": cfg.seed,
             "best_loss": best_loss,
             "best_epoch": best_epoch,
@@ -765,6 +787,7 @@ def _parse_args() -> Config:
     p.add_argument("--warmup-t", type=int, default=Config.warmup_t)
     p.add_argument("--lr-min", type=float, default=Config.lr_min)
     p.add_argument("--optimizer-name", type=str, default=Config.optimizer_name, choices=["sgd", "adam"])
+    p.add_argument("--use-scheduler", action="store_true", default=Config.use_scheduler)
 
     p.add_argument("--accumulation-steps", type=int, default=Config.accumulation_steps)
     p.add_argument("--use-amp", action="store_true", default=Config.use_amp)
@@ -831,6 +854,7 @@ def _parse_args() -> Config:
         kd_symmetrize=args.kd_symmetrize,
         kd_weight_rkd=args.kd_weight_rkd,
         kd_weight_list=args.kd_weight_list,
+        use_scheduler=args.use_scheduler,
     )
     return cfg
 
@@ -958,6 +982,7 @@ def main():
         loaders, datasets = data.build()
 
         teacher_backbone = None
+        manifold=None
         if cfg.kd_enable:
             tb = ModelBuilder(cfg, cfg.teacher_name, pretrained=True, ViT_size="small", freeze_backbone=True)
             teacher_backbone, _, _ = tb.build()
@@ -974,6 +999,24 @@ def main():
 
         backbone = backbone.to(device)
         objective = objective.to(device)
+
+        # with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
+        #     overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+        #     logger = wb
+        #     logger.log({"metrics/overall_acc": overall})
+        #     if logger.active and _wandb is not None:
+        #         table = _wandb.Table(columns=["dataset", "accuracy"])
+        #         for ds, acc in sorted(per_dataset_acc.items()):
+        #             table.add_data(ds, acc)
+        #             _wandb.summary[f"acc_by_dataset/{ds}"] = acc
+        #         logger.log({"per_dataset_accuracy_table": table})
+        #         logger.log(
+        #             {
+        #                 "plots/per_dataset_accuracy": _wandb.plot.bar(
+        #                     table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy"
+        #                 )
+        #             }
+        #         )
 
         _ = fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, manifold, teacher_backbone=teacher_backbone)
 

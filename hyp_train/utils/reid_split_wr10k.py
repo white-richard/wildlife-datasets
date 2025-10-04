@@ -164,6 +164,20 @@ def build_reid_pipeline(
     meta = WildlifeReID10k(cfg.root)
     df = meta.df  # pandas DataFrame
 
+    # print(df.head())
+    # print(df.columns)
+
+    # print(df['species'].unique())
+
+    df = df[df['species'] == 'sea turtle']
+    print(f"Unique datasets used to train: {df['dataset'].unique()} !!!")
+    # print(df.head())
+    # print(df.columns)
+    # print("Total images:", len(df))
+
+    # Filter for multiple species at once, e.g. turtles + beluga_whales
+    # subset = df[df['species'].isin(['turtle', 'beluga_whale'])]
+
     # 2) Identities: train vs test (no overlap)
     train_ids, test_ids = _split_identities(
         df, frac_train_ids=frac_train_ids, seed=seed, col_label=col_label
