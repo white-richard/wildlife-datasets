@@ -9,7 +9,7 @@ class AugCfg:
     erasing_p: float = 0.25
     crop_min_scale: float = 0.7
 
-def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
+def build_train_tfms(img_size: int, a: AugCfg, mean: list[float], std: list[float]) -> T.Compose:
     d = img_size
     if a.policy == "weak":
         raise
@@ -54,12 +54,12 @@ def build_train_tfms(img_size: int, a: AugCfg) -> T.Compose:
         #     T.Normalize([0.5]*3, [0.5]*3),
         #     T.RandomErasing(p=a.erasing_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
         # ]
-        tfms = T.Compose([
+        tfms = [
             T.RandomResizedCrop(size=(d, d), scale=(0.8, 1.0)),
             T.RandAugment(num_ops=2, magnitude=20),
             T.ToTensor(),
-            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ])
+            T.Normalize(mean=mean, std=std),
+        ]
     elif a.policy == "augmix":
         raise
         tfms = [
