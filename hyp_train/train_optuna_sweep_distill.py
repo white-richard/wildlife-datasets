@@ -748,6 +748,7 @@ def fit(
         if trial is not None:
             trial.report(train_mAP, step=epoch)
             if trial.should_prune():
+                print(f"Trial pruned at epoch {epoch}.")
                 if _wandb.run is not None:
                     _wandb.summary["pruned_at_epoch"] = epoch
                 raise optuna.exceptions.TrialPruned()
