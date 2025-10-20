@@ -9,6 +9,8 @@ from hypercore.utils.manifold_utils import lift_spatial_with_projx
 
 def _get_window_size_from_block(block):
     attn = getattr(block, 'attn', None)
+    if attn is None:
+        raise ValueError("Block does not have 'attn' attribute.")
     ws = getattr(attn, 'window_size', 7) if attn is not None else 7
     return int(ws[0] if isinstance(ws, (tuple, list)) else ws)
 
@@ -19,6 +21,8 @@ def _stage_width(stage):
         return int(blk0.norm1.normalized_shape[0])
     if hasattr(stage, 'norm') and hasattr(stage.norm, 'normalized_shape'):
         return int(stage.norm.normalized_shape[0])
+    
+    raise NotImplementedError("Couldn't infer stage width from normalization layers.")
     # fallback via qkv
     qkv = getattr(getattr(blk0, 'attn', object()), 'qkv', None)
     if qkv is not None and hasattr(qkv, 'out_features'):
