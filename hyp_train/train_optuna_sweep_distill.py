@@ -8,14 +8,14 @@ docker run -d --name optuna-pg \
   -e POSTGRES_PASSWORD=optuna-pg \
   -e POSTGRES_DB=wr10k \
   -v optuna_pgdata:/var/lib/postgresql/data \
-  -p 100.113.213.2:5432:5432 \
+  -p 100.121.43.41:5432:5432 \
   postgres:15
 
 python train_optuna_sweep_distill.py \
   --tune-trials -1 \
   --tune-direction maximize \
-  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k \
-  --tune-study wr10k_megadesc_lastLayerHyp \
+  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.121.43.41:5432/wr10k \
+  --tune-study wr10k_megadesc_lastLayer \
   --wandb online --project reproduce_mega_descriptor \
   --tune-seed 42
 """
@@ -90,7 +90,7 @@ class Config:
     # root: str = "/home/richw/.code/datasets/CzechLynx"
 
     img_size: int = 224
-    num_workers: int = 16
+    num_workers: int = 8
     train_batch: int = 96
     eval_batch: int = 128
     aug_policy: str = "randaug"  # baseline | weak | strong | randaug | augmix
@@ -135,7 +135,7 @@ class Config:
 
     # training loop
     accumulation_steps: int = 1
-    use_amp: bool = False
+    use_amp: bool = True
     val_interval: int = 1
     patience: int = 15
     use_scheduler: bool = True
@@ -330,10 +330,16 @@ class ModelBuilder:
             
             ViT_size = self.ViT_size[0].upper()
             backbone = timm.create_model(
-                f"hf-hub:BVRA/MegaDescriptor-{ViT_size}-224", num_classes=0, pretrained=self.pretrained
+                f"hf-hub:BVRA/MegaDescriptor-{ViT_size}-224", num_classes=0, pretrained=True
             )
             emb_dim = backbone.num_features
             reinit_module(backbone.layers[-1])
+            for _, p in backbone.named_parameters():
+                p.requires_grad = False
+            # unfreeze last layer
+            for p in backbone.layers[-1].parameters():
+                p.requires_grad = True
+           
 
         elif self.model_name == "megadescriptor_replace_last_layer_hyp":
             if self.ViT_size != "base":
@@ -748,6 +754,7 @@ def fit(
         if trial is not None:
             trial.report(train_mAP, step=epoch)
             if trial.should_prune():
+                print(f"Trial pruned at epoch {epoch}.")
                 if _wandb.run is not None:
                     _wandb.summary["pruned_at_epoch"] = epoch
                 raise optuna.exceptions.TrialPruned()
