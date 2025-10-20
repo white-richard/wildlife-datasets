@@ -205,9 +205,9 @@ def build_reid_pipeline(
 
 
     # df = df[df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
-    df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+    # df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
 
-    print(df['dataset'].unique())
+    # print(df['dataset'].unique())
 
     # 1) Split identities (unchanged)
     train_ids, test_ids = _split_identities(
