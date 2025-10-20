@@ -154,14 +154,14 @@ def build_reid_pipeline(
     seed = getattr(cfg, "seed", 42)
 
     # For lynx dataset
-    # import os
-    # metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
-    # meta = WildlifeDataset(cfg.root, metadata) 
-    # df = _normalize_meta_df(meta.df, cfg.root)
+    import os
+    metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
+    meta = WildlifeDataset(cfg.root, metadata) 
+    df = _normalize_meta_df(meta.df, cfg.root)
 
-    meta = WildlifeReID10k(cfg.root)
-    df = meta.df
-    df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+    # meta = WildlifeReID10k(cfg.root)
+    # df = meta.df
+    # df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
 
 #     datasets = 
 #     # List of datasets reported in the WR10k paper

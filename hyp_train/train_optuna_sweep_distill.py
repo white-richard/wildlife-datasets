@@ -86,8 +86,8 @@ class Config:
     save_dir: str = "checkpoints"
 
     # data
-    root: str = "../../../datasets/wildlifereid-10k"
-    # root: str = "/home/richw/.code/datasets/CzechLynx"
+    # root: str = "../../../datasets/wildlifereid-10k"
+    root: str = "/home/richw/.code/datasets/CzechLynx"
 
     img_size: int = 224
     num_workers: int = 8
@@ -98,12 +98,12 @@ class Config:
     data_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     # model / paradigm
-    model_name: str = "megadescriptor_lastLayer" # megadescriptor_replace_last_layer_hyp  # choices below
+    model_name: str = "wr10k_megadesc_lastLayerHyp" # megadescriptor_replace_last_layer_hyp  # choices below
     teacher_name: str = "megadescriptor"  # choices below
-    loss_type: str = "arcface"  # arcface | triplet
+    loss_type: str = "triplet"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
     type_of_triplets: str = "semihard"  # all | hard | semihard | easy | None
-    hyperbolic: bool = False
+    hyperbolic: bool = True
 
     # --- KD / Distillation ---
     kd_enable: bool = False  # turn KD on
@@ -118,8 +118,8 @@ class Config:
 
     # optimization
     epochs: int = 60
-    lr: float = 1e-3
-    wd: float = 1e-4
+    lr: float = 0.0000957148605087535
+    wd: float = 0.0010688021642081323 #1e-4
     momentum: float = 0.9
     warmup_t: int = 5
     lr_min: float = 1e-6
