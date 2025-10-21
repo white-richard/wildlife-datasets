@@ -55,11 +55,13 @@ def build_train_tfms(img_size: int, a: AugCfg, mean: list[float], std: list[floa
         #     T.RandomErasing(p=a.erasing_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random', inplace=True),
         # ]
         tfms = [
-            T.RandomResizedCrop(size=(d, d), scale=(0.8, 1.0)),
+            T.Resize(256),  # Resize shorter edge to 256, better preserves aspect ratio
+            T.RandomCrop(224),  # Random 224x224 crop
             T.RandAugment(num_ops=2, magnitude=20),
             T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
         ]
+        if mean is not None and std is not None:
+            tfms.append(T.Normalize(mean, std))
     elif a.policy == "augmix":
         raise
         tfms = [

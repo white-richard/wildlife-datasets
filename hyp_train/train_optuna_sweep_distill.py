@@ -32,6 +32,7 @@ import numpy as np
 import optuna
 import timm
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.init as init
 import torchvision.transforms as T
@@ -39,7 +40,8 @@ import wandb as _wandb
 from geoopt import ManifoldParameter
 from hypercore.manifolds.lorentzian import Lorentz
 from hypercore.models.Swin_LViT import LSwin_base, LSwin_small, LSwin_tiny
-from hypercore.modules.loss import LorentzTripletLoss
+from hypercore.models.LViT import LViT_base, LViT_small, LViT_tiny
+from hypercore.modules.loss import LorentzTripletLoss, LorentzArcFaceLoss
 from hypercore.optimizers import RiemannianAdam, RiemannianSGD
 import hypercore.nn as hnn
 from hypercore.utils.manifold_utils import lock_curvature_to_one
@@ -62,6 +64,7 @@ from utils.validation import validate_split
 from utils.wandb_session import WandbMode, WandbSession
 from utils.load_checkpoint import load_checkpoint
 from utils.triplet_w_miner import TripletLossWithMiner
+from utils.calc_mean_std import calculate_normalization_stats
 
 torch.backends.cudnn.benchmark = True
 
@@ -86,26 +89,29 @@ class Config:
     seed: int = 42
     save_dir: str = "checkpoints"
 
+    dataset_name: str = "ATRW"  # wildlife10k | lynx | ATRW
+
     # data
-    # root: str = "../../../datasets/wildlifereid-10k"
-    root: str = "/home/richw/.code/datasets/CzechLynx"
+    root: str = "../../../datasets/wildlifereid-10k"
 
     img_size: int = 224
     num_workers: int = 8
-    train_batch: int = 96
-    eval_batch: int = 128
+    train_batch: int = 32
+    eval_batch: int = 64
     aug_policy: str = "randaug"  # baseline | weak | strong | randaug | augmix
-    data_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    data_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    calculate_mean_std: bool = True
+    data_mean: Tuple[float, float, float] = None #(0.485, 0.456, 0.406)
+    data_std: Tuple[float, float, float] = None #(0.229, 0.224, 0.225)
 
     # model / paradigm
-    model_name: str = "wr10k_megadesc_lastLayerHyp" # megadescriptor_replace_last_layer_hyp  # choices below
+    model_name: str = "ViT" # megadescriptor_replace_last_layer_hyp | ViT | LViT  # choices below
+    ViT_size: str = "base"  # base | small | tiny
     teacher_name: str = "megadescriptor"  # choices below
     loss_type: str = "triplet"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
     type_of_triplets: str = "semihard"  # all | hard | semihard | easy | None
     hyperbolic: bool = False
-    freeze_backbone: bool = True  # freeze backbone weights, train last layer only
+    freeze_backbone: bool = False  # freeze backbone weights
     pretrained: bool = False  # use pretrained weights where applicable
 
     # --- KD / Distillation ---
@@ -120,9 +126,9 @@ class Config:
     kd_weight_list: float = 0.0  # not used yet (stub)
 
     # optimization
-    epochs: int = 60
-    lr: float = 0.0000957148605087535
-    wd: float = 0.0010688021642081323 #1e-4
+    epochs: int = 2
+    lr: float = 0.00008468008575248323
+    wd: float = 0.006351221010640704 #1e-4
     momentum: float = 0.9
     warmup_t: int = 5
     lr_min: float = 1e-6
@@ -138,15 +144,14 @@ class Config:
 
     # training loop
     accumulation_steps: int = 1
-    use_amp: bool = True
+    use_amp: bool = False
     val_interval: int = 1
     patience: int = 15
     use_scheduler: bool = True
-    print("Using scheduler:", use_scheduler)
 
     # logging
     wandb_mode: WandbMode = WandbMode.OFF
-    project: str = "reproduce_mega_descriptor"
+    project: str = "expr_hyp_vs_euc_reid"
 
 
 def init_weights_xavier(m):
@@ -157,6 +162,33 @@ def init_weights_xavier(m):
     elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
         init.ones_(m.weight)
         init.zeros_(m.bias)
+
+def compute_grad_stats(modules: List[nn.Module]) -> Dict[str, object]:
+    """
+    Compute gradient statistics for a list of modules.
+    Returns dict with keys: grad_norm (global L2), max_abs, has_nan, layer_norms(dict).
+    """
+    total_sq = 0.0
+    max_abs = 0.0
+    has_nan = False
+    layer_norms: Dict[str, float] = {}
+    for mod in modules:
+        for name, p in mod.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            # per-parameter L2 norm
+            try:
+                norm_val = float(g.norm().item())
+            except Exception:
+                norm_val = float(torch.sqrt((g * g).sum()).item())
+            total_sq += norm_val * norm_val
+            max_abs = max(max_abs, float(g.abs().max().item()))
+            if not torch.isfinite(g).all():
+                has_nan = True
+            layer_norms[name] = norm_val
+    grad_norm = float(total_sq ** 0.5)
+    return {"grad_norm": grad_norm, "max_abs": max_abs, "has_nan": has_nan, "layer_norms": layer_norms}
 
 
 def split_decay_groups(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
@@ -196,16 +228,29 @@ def remove_curvature_from_optimizer(optimizer, manifold) -> None:
             print(f"Dropped curvature param {p} from optimizer.")
 
 
-def suggest_params(trial: "optuna.trial.Trial", base_cfg: Config) -> Dict[str, object]:
-    params = {
-        "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
-        "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
-        "epochs": trial.suggest_int("epochs", 30, 100, step=10),
-        # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
-        # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
-        "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
-        # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
-    }
+def suggest_params(trial: "optuna.trial.Trial", cfg: Config) -> Dict[str, object]:
+    if cfg.hyperbolic:
+        params = {
+            # "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
+            "lr": trial.suggest_categorical("lr", [0.1, 0.01, 0.001, 0.0005, 0.0001, 0.00005, 0.00001, 0.000001]),
+            # "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
+            "epochs": trial.suggest_int("epochs", 30, 100, step=10),
+            # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
+            # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
+            # "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
+            # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
+        }
+    else:
+        params = {
+            # "lr": trial.suggest_float("lr", 1e-2, 3e-3, log=True),
+            "lr": trial.suggest_categorical("lr", [0.1, 0.01, 0.001, 0.0001, 0.00001]),
+            # "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
+            "epochs": trial.suggest_int("epochs", 30, 100, step=10),
+            # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
+            # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
+            # "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
+            # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
+        }
     return params
 
 
@@ -219,14 +264,16 @@ class DataBuilder:
 
     def _eval_tfms(self) -> T.Compose:
         d = self.cfg.img_size
-        return T.Compose(
+        transform = T.Compose(
             [
-                T.Resize(int(d / 0.875), interpolation=T.InterpolationMode.BICUBIC),
+                T.Resize(256),
                 T.CenterCrop(d),
                 T.ToTensor(),
-                T.Normalize(self.cfg.data_mean, self.cfg.data_std),
             ]
         )
+        if self.cfg.data_mean is not None and self.cfg.data_std is not None:
+            transform.transforms.append(T.Normalize(self.cfg.data_mean, self.cfg.data_std))
+        return transform
 
     def build(self):
         splits_out = build_reid_pipeline(
@@ -373,6 +420,36 @@ class ModelBuilder:
             manifold = hyp_stages[-1].manifold
             # NOTE: This model manages its own freezing, so we return early
             return backbone, emb_dim, manifold
+        elif self.model_name == "ViT":
+            backbone = timm.create_model(
+                f"vit_{self.ViT_size}_patch16_224", num_classes=0, pretrained=self.pretrained
+            )
+            emb_dim = backbone.num_features
+            if not self.pretrained:
+                backbone.apply(init_weights_xavier)
+        elif self.model_name == "LViT":
+            if self.pretrained:
+                raise ValueError("LViT does not support pretrained=True")
+            manifold = Lorentz()
+            lock_curvature_to_one(manifold)
+            if self.ViT_size == "base":
+                backbone = LViT_base(manifold, manifold, manifold, num_classes=0)
+            elif self.ViT_size == "small":
+                backbone = LViT_small(manifold, manifold, manifold, num_classes=0)
+            elif self.ViT_size == "tiny":
+                backbone = LViT_tiny(manifold, manifold, manifold, num_classes=0)
+            else:
+                raise ValueError(f"Unsupported ViT_size {self.ViT_size} for LViT")
+            for p in backbone.parameters():
+                if isinstance(p, ManifoldParameter):
+                    p.requires_grad_(False)
+            backbone.eval()
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, self.cfg.img_size, self.cfg.img_size)
+                out = backbone(dummy)
+            backbone.train()
+            emb_dim = out.shape[1]
+            manifold = backbone.manifold
         else:
             raise ValueError(f"Unknown model_name {self.model_name}")
 
@@ -387,6 +464,8 @@ class ObjectiveBuilder:
     @staticmethod
     def build(loss_type: str, num_classes: int, emb_dim: int, hyperbolic: bool, manifold=None, use_xbm: bool = False, type_of_triplets: str = "semihard") -> nn.Module:
         if loss_type == "arcface":
+            if hyperbolic:
+                return LorentzArcFaceLoss(manifold, scale=64.0, margin=0.5, num_classes=num_classes, embedding_size=emb_dim)
             return ArcFaceLoss(num_classes=num_classes, embedding_size=emb_dim, margin=0.5, scale=64)
         if loss_type == "triplet":
             if hyperbolic:
@@ -676,7 +755,6 @@ def train_one_epoch(
                         f"epoch {epoch} | iter {i+1}/{steps_per_epoch} "
                         f"| loss {float(running_loss)/(i+1):.4f} | val_mAP {mAP:.4f} | val_top1 {acc1:.4f} | val_top5 {acc5:.4f} | val_top10 {acc10:.4f}"
                     )
-
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
         if _wandb.run is not None and cfg is not None and cfg.kd_enable and cfg.kd_weight_pkt > 0.0 and loss_pkt is not None:
             _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/loss_pkt")
@@ -711,9 +789,6 @@ def fit(
     best_epoch = -1
     no_improve = 0
 
-    if cfg.hyperbolic and cfg.loss_type != "triplet":
-        raise ValueError("Hyperbolic training is only supported with triplet loss currently.")
-
     paradigm = TrainingParadigm.REGISTRY[cfg.loss_type]
     scaler = amp.GradScaler(enabled=cfg.use_amp)
 
@@ -744,7 +819,7 @@ def fit(
             best_epoch = epoch
             no_improve = 0
             run_name = _wandb.run.name if _wandb.run is not None else "unknown_run"
-            save_path=os.path.join(cfg.save_dir, f"{run_name}_best_epoch{epoch}.pt")
+            save_path=os.path.join(cfg.save_dir, f"{run_name}_best.pt")
             print(f"Saving best checkpoint to {save_path}")
             torch.save(
                 {
@@ -756,6 +831,8 @@ def fit(
                     "seed": cfg.seed,
                     "best_mAP": best_mAP,
                     "learning_rate": optimizer.param_groups[0]["lr"],
+                    "mean": cfg.data_mean,
+                    "std": cfg.data_std,
                 },
                 save_path,
             )
@@ -809,11 +886,13 @@ def fit(
             "seed": cfg.seed,
             "best_loss": best_loss,
             "best_epoch": best_epoch,
+            "mean": cfg.data_mean,
+            "std": cfg.data_std,
         },
         save_path,
     )
 
-    print(f"\nTraining done. Best loss={best_loss:.4f} at epoch {best_epoch}. Final checkpoint saved.")
+    print(f"\nTraining done. Best mAP={best_mAP:.4f} at epoch {best_epoch}. Final checkpoint saved.")
 
     overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
     logger.log({"metrics/overall_acc": overall})
@@ -968,12 +1047,12 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
         teacher_backbone = None
         manifold=None
         if cfg.kd_enable:
-            tb = ModelBuilder(cfg, cfg.teacher_name, pretrained=True, ViT_size="base", freeze_backbone=True)
+            tb = ModelBuilder(cfg, cfg.teacher_name, pretrained=True, ViT_size=cfg.ViT_size, freeze_backbone=True)
             teacher_backbone, _, _ = tb.build()
             teacher_backbone = teacher_backbone.to(device)
             teacher_backbone.eval()
 
-        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size="base", freeze_backbone=cfg.freeze_backbone)
+        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size=cfg.ViT_size, freeze_backbone=cfg.freeze_backbone)
         backbone, emb_dim, manifold = mb.build()
         num_classes = datasets["train"].num_classes
         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold, use_xbm=cfg.use_xbm, type_of_triplets=cfg.type_of_triplets)
@@ -1061,13 +1140,16 @@ def main():
         teacher_backbone = None
         manifold=None
         if cfg.kd_enable:
-            tb = ModelBuilder(cfg, cfg.teacher_name, pretrained=True, ViT_size="base", freeze_backbone=True)
+            tb = ModelBuilder(cfg, cfg.teacher_name, pretrained=True, ViT_size=cfg.ViT_size, freeze_backbone=True)
             teacher_backbone, _, _ = tb.build()
             teacher_backbone = teacher_backbone.to(device)
             teacher_backbone.eval()
 
-        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size="base", freeze_backbone=cfg.freeze_backbone)
+        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size=cfg.ViT_size, freeze_backbone=cfg.freeze_backbone)
         backbone, emb_dim, manifold = mb.build()
+        # print total trainable parameters
+        total_trainable_params = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+        print(f"Total trainable parameters in backbone: {total_trainable_params}")
         num_classes = datasets["train"].num_classes
         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold, use_xbm=cfg.use_xbm, type_of_triplets=cfg.type_of_triplets)
 
@@ -1077,8 +1159,7 @@ def main():
         backbone = backbone.to(device)
         objective = objective.to(device)
 
-        if True:
-
+        if False:
             with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
                 overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
                 logger = wb

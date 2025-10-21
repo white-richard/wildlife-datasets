@@ -153,15 +153,18 @@ def build_reid_pipeline(
 ) -> ReIDSplits:
     seed = getattr(cfg, "seed", 42)
 
-    # For lynx dataset
-    import os
-    metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
-    meta = WildlifeDataset(cfg.root, metadata) 
-    df = _normalize_meta_df(meta.df, cfg.root)
-
-    # meta = WildlifeReID10k(cfg.root)
-    # df = meta.df
-    # df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+    if cfg.dataset_name == "lynx":
+        # For lynx dataset
+        import os
+        metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
+        meta = WildlifeDataset(cfg.root, metadata) 
+        df = _normalize_meta_df(meta.df, cfg.root)
+    else:
+        meta = WildlifeReID10k(cfg.root)
+        df = meta.df
+        df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+        if cfg.dataset_name != "wildlife10k":
+            df = df[df['dataset'].isin([cfg.dataset_name])]
 
 #     datasets = 
 #     # List of datasets reported in the WR10k paper
@@ -205,6 +208,7 @@ def build_reid_pipeline(
 
 
     # df = df[df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
+    # if cfg.dataset_name != "turtle_beluga":
     # df = df[~df['dataset'].isin(['Drosophila', 'SeaTurtleID2022'])]
 
     # print(df['dataset'].unique())
@@ -245,6 +249,20 @@ def build_reid_pipeline(
     _assert_non_empty("dev_qry", df_dev_qry)
     _assert_non_empty("test_ref", df_test_ref)
     _assert_non_empty("test_qry", df_test_qry)
+
+    # Calculate mean and std if needed
+    from utils.calc_mean_std import calculate_normalization_stats
+    import torchvision.transforms as T
+    if cfg.calculate_mean_std:
+        mean, std = calculate_normalization_stats(df_train_fit, cfg.root, image_size=cfg.img_size)
+        cfg.data_mean = tuple(mean)
+        cfg.data_std = tuple(std)
+        print(f"Calculated train dataset mean: {cfg.data_mean}, std: {cfg.data_std}")
+        normalize = T.Normalize(mean, std)
+        if isinstance(train_transform, T.Compose):
+            # Compose stores its sequence in .transforms
+            train_transform = T.Compose(list(train_transform.transforms) + [normalize])
+            val_transform = T.Compose(list(val_transform.transforms) + [normalize])
 
     # 6) Build datasets/loaders (unchanged)
     train_fit_set = WR10kDataset(df_train_fit, cfg.root, train_transform)
