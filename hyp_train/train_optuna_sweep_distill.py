@@ -61,6 +61,7 @@ from utils.reid_split_wr10k import build_reid_pipeline
 from utils.validation import validate_split
 from utils.wandb_session import WandbMode, WandbSession
 from utils.load_checkpoint import load_checkpoint
+from utils.triplet_w_miner import TripletLossWithMiner
 
 torch.backends.cudnn.benchmark = True
 
@@ -103,7 +104,9 @@ class Config:
     loss_type: str = "triplet"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
     type_of_triplets: str = "semihard"  # all | hard | semihard | easy | None
-    hyperbolic: bool = True
+    hyperbolic: bool = False
+    freeze_backbone: bool = True  # freeze backbone weights, train last layer only
+    pretrained: bool = False  # use pretrained weights where applicable
 
     # --- KD / Distillation ---
     kd_enable: bool = False  # turn KD on
@@ -303,7 +306,7 @@ class ModelBuilder:
             elif self.ViT_size == "small":
                 backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
             elif self.ViT_size == "tiny":
-                backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
+                backbone = LSwin_tiny(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
             else:
                 raise ValueError(f"Unsupported ViT_size {self.ViT_size} for hyperbolic swin")
             for p in backbone.parameters():
@@ -334,12 +337,14 @@ class ModelBuilder:
             )
             emb_dim = backbone.num_features
             reinit_module(backbone.layers[-1])
+            # Freeze all parameters first
             for _, p in backbone.named_parameters():
                 p.requires_grad = False
-            # unfreeze last layer
+            # Unfreeze last layer - this handles the freeze_backbone logic internally
             for p in backbone.layers[-1].parameters():
                 p.requires_grad = True
-           
+            return backbone, emb_dim, manifold
+            # NOTE: skip the self.freeze_backbone check at the end for this model
 
         elif self.model_name == "megadescriptor_replace_last_layer_hyp":
             if self.ViT_size != "base":
@@ -366,6 +371,8 @@ class ModelBuilder:
             backbone.train()
             emb_dim = out.shape[1]
             manifold = hyp_stages[-1].manifold
+            # NOTE: This model manages its own freezing, so we return early
+            return backbone, emb_dim, manifold
         else:
             raise ValueError(f"Unknown model_name {self.model_name}")
 
@@ -384,9 +391,8 @@ class ObjectiveBuilder:
         if loss_type == "triplet":
             if hyperbolic:
                 return LorentzTripletLoss(manifold, margin=0.2, type_of_triplets=type_of_triplets, feature_dim=emb_dim, use_xbm=use_xbm)
-            return nn.TripletMarginLoss(margin=0.2, p=2)
+            return TripletLossWithMiner(margin=0.2, type_of_triplets=type_of_triplets)
         raise ValueError(f"Unknown loss_type {loss_type}")
-
 
 class OptimBuilder:
     def __init__(self, cfg: Config):
@@ -397,6 +403,21 @@ class OptimBuilder:
         wd = self.cfg.wd
         decay, no_decay = split_decay_groups(backbone)
         head_params = [p for p in head.parameters() if p.requires_grad]
+
+        # Safety check: ensure we have trainable parameters
+        # For triplet loss, head params are not added to optimizer but backbone should have trainable params
+        # For arcface, both backbone and head should have trainable params
+        total_trainable = len(decay) + len(no_decay)
+        if self.cfg.loss_type != "triplet":
+            total_trainable += len(head_params)
+        
+        if total_trainable == 0:
+            raise ValueError(
+                f"No trainable parameters found! "
+                f"Backbone trainable params: {len(decay) + len(no_decay)}, "
+                f"Head trainable params: {len(head_params)}. "
+                f"Check freeze_backbone={self.cfg.freeze_backbone} and model={self.cfg.model_name}"
+            )
 
         if self.cfg.hyperbolic:
             if self.cfg.optimizer_name == "adam":
@@ -579,10 +600,14 @@ def train_one_epoch(
 
             base_loss = paradigm.criterion_forward(head, feats, y) / accumulation_steps
             loss = base_loss
+            loss_pkt = None  # Initialize to None
 
             if cfg is not None and cfg.kd_enable and cfg.kd_weight_pkt > 0.0:
+                raise NotImplementedError("KD with PKT in hyperbolic setting is not implemented in this snippet.")
                 if teacher is None:
                     raise RuntimeError("KD enabled but teacher is None.")
+                if manifold is None:
+                    raise RuntimeError("KD with PKT requires hyperbolic student model (manifold is None).")
 
                 # Teacher forward (Euclidean), L2-normalized for cosine
                 with torch.no_grad():
@@ -653,7 +678,7 @@ def train_one_epoch(
                     )
 
         pbar.set_description(f"epoch {epoch} | loss {float(running_loss)/(i+1):.4f}")
-        if _wandb.run is not None and cfg is not None and cfg.kd_enable and cfg.kd_weight_pkt > 0.0:
+        if _wandb.run is not None and cfg is not None and cfg.kd_enable and cfg.kd_weight_pkt > 0.0 and loss_pkt is not None:
             _wandb.define_metric(step_metric = wandb_step_name, name = "train_loop/loss_pkt")
 
             _wandb.log(
@@ -718,7 +743,8 @@ def fit(
             best_mAP = train_mAP
             best_epoch = epoch
             no_improve = 0
-            save_path=os.path.join(cfg.save_dir, f"{_wandb.run.name}_best_epoch{epoch}.pt")
+            run_name = _wandb.run.name if _wandb.run is not None else "unknown_run"
+            save_path=os.path.join(cfg.save_dir, f"{run_name}_best_epoch{epoch}.pt")
             print(f"Saving best checkpoint to {save_path}")
             torch.save(
                 {
@@ -770,7 +796,8 @@ def fit(
             print(f"\nEarly stopping at epoch {epoch}")
             break
 
-    save_path=os.path.join(cfg.save_dir, f"{_wandb.run.name}_final.pt")
+    run_name = _wandb.run.name if _wandb.run is not None else "unknown_run"
+    save_path=os.path.join(cfg.save_dir, f"{run_name}_final.pt")
     print(f"Saving final checkpoint to {save_path}")
     torch.save(
         {
@@ -946,7 +973,7 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
             teacher_backbone = teacher_backbone.to(device)
             teacher_backbone.eval()
 
-        mb = ModelBuilder(cfg, cfg.model_name, pretrained=False, ViT_size="base")
+        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size="base", freeze_backbone=cfg.freeze_backbone)
         backbone, emb_dim, manifold = mb.build()
         num_classes = datasets["train"].num_classes
         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold, use_xbm=cfg.use_xbm, type_of_triplets=cfg.type_of_triplets)
@@ -1039,7 +1066,7 @@ def main():
             teacher_backbone = teacher_backbone.to(device)
             teacher_backbone.eval()
 
-        mb = ModelBuilder(cfg, cfg.model_name, pretrained=False, ViT_size="base")
+        mb = ModelBuilder(cfg, cfg.model_name, pretrained=cfg.pretrained, ViT_size="base", freeze_backbone=cfg.freeze_backbone)
         backbone, emb_dim, manifold = mb.build()
         num_classes = datasets["train"].num_classes
         objective = ObjectiveBuilder.build(cfg.loss_type, num_classes, emb_dim, cfg.hyperbolic, manifold, use_xbm=cfg.use_xbm, type_of_triplets=cfg.type_of_triplets)
@@ -1050,29 +1077,31 @@ def main():
         backbone = backbone.to(device)
         objective = objective.to(device)
 
-        # with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
-        #     overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
-        #     logger = wb
-        #     logger.log({"metrics/overall_acc": overall})
-        #     if logger.active and _wandb is not None:
-        #         table = _wandb.Table(columns=["dataset", "accuracy"])
-        #         for ds, acc in sorted(per_dataset_acc.items()):
-        #             table.add_data(ds, acc)
-        #             _wandb.summary[f"acc_by_dataset/{ds}"] = acc
-        #         logger.log({"per_dataset_accuracy_table": table})
-        #         logger.log(
-        #             {
-        #                 "plots/per_dataset_accuracy": _wandb.plot.bar(
-        #                     table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy"
-        #                 )
-        #             }
-        #         )
-        # checkpoint_path = "/home/richw/.code/repos/wildlife-datasets/hyp_train/dandy-darkness-143_best_epoch73.pt"
-        # load_checkpoint(checkpoint_path, backbone)
-        # overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
-        # print(f"Overall acc: {overall}.")
+        if True:
 
-        _ = fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, manifold, teacher_backbone=teacher_backbone)
+            with WandbSession(cfg.wandb_mode, cfg.project, cfg.run_name, asdict(cfg)) as wb:
+                overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+                logger = wb
+                logger.log({"metrics/overall_acc": overall})
+                if logger.active and _wandb is not None:
+                    table = _wandb.Table(columns=["dataset", "accuracy"])
+                    for ds, acc in sorted(per_dataset_acc.items()):
+                        table.add_data(ds, acc)
+                        _wandb.summary[f"acc_by_dataset/{ds}"] = acc
+                    logger.log({"per_dataset_accuracy_table": table})
+                    logger.log(
+                        {
+                            "plots/per_dataset_accuracy": _wandb.plot.bar(
+                                table, "dataset", "accuracy", title="Per-dataset Top-1 Accuracy"
+                            )
+                        }
+                    )
+            checkpoint_path = "/home/richw/.code/repos/wildlife-datasets/hyp_train/best/solar-vortex-148_best_epoch73.pt"
+            load_checkpoint(checkpoint_path, backbone)
+            overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
+            print(f"Overall acc: {overall}.")
+        else:
+            _ = fit(cfg, backbone, objective, loaders, optimizer, scheduler, device, wb, manifold, teacher_backbone=teacher_backbone)
 
 
 if __name__ == "__main__":
