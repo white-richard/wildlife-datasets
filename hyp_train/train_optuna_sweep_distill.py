@@ -1,9 +1,10 @@
 """
 Starts a PostgreSQL server for Optuna with:
-docker container stop optuna-pg
-docker container rm optuna-pg
+sudo docker container stop optuna-pg
+sudo docker container rm optuna-pg
+sudo docker volume rm optuna_pgdata
 
-docker run -d --name optuna-pg \
+sudo docker run -d --name optuna-pg \
   -e POSTGRES_USER=optuna \
   -e POSTGRES_PASSWORD=optuna-pg \
   -e POSTGRES_DB=wr10k \
@@ -15,9 +16,31 @@ python train_optuna_sweep_distill.py \
   --tune-trials -1 \
   --tune-direction maximize \
   --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.121.43.41:5432/wr10k \
-  --tune-study wr10k_megadesc_lastLayer \
-  --wandb online --project reproduce_mega_descriptor \
+  --tune-study hyp_vs_euc \
+  --wandb online --project hyp_vs_euc \
   --tune-seed 42
+
+
+python train_optuna_sweep_distill.py \
+  --tune-trials 30 \
+  --tune-direction maximize \
+  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.121.43.41:5432/wr10k \
+  --tune-study hyp_vs_euc \
+  --wandb online --project hyp_vs_euc_sweep_size \
+  --tune-seed 42 \
+  --hyperbolic \
+  --model-name "LViT" \
+  --tune-min-epochs 60 \
+; python train_optuna_sweep_distill.py \
+  --tune-trials 30 \
+  --tune-direction maximize \
+  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.121.43.41:5432/wr10k \
+  --tune-study hyp_vs_euc \
+  --wandb online --project hyp_vs_euc_sweep_size \
+  --model-name "ViT" \
+  --tune-seed 42 \
+  --tune-min-epochs 60
+
 """
 from __future__ import annotations
 
@@ -41,8 +64,9 @@ from geoopt import ManifoldParameter
 from hypercore.manifolds.lorentzian import Lorentz
 from hypercore.models.Swin_LViT import LSwin_base, LSwin_small, LSwin_tiny
 from hypercore.models.LViT import LViT_base, LViT_small, LViT_tiny
+from utils.euclidean_ViT import vit_b_16, vit_s_16, vit_t_16
 from hypercore.modules.loss import LorentzTripletLoss, LorentzArcFaceLoss
-from hypercore.optimizers import RiemannianAdam, RiemannianSGD
+from hypercore.optimizers import RiemannianAdam, RiemannianSGD, RiemannianAdamW
 import hypercore.nn as hnn
 from hypercore.utils.manifold_utils import lock_curvature_to_one
 from timm.scheduler import CosineLRScheduler
@@ -105,7 +129,8 @@ class Config:
 
     # model / paradigm
     model_name: str = "ViT" # megadescriptor_replace_last_layer_hyp | ViT | LViT  # choices below
-    ViT_size: str = "base"  # base | small | tiny
+    ViT_size: str = "small"  # base | small | tiny
+    output_embed_dim: Optional[int] = None  # None = use default embedding dim
     teacher_name: str = "megadescriptor"  # choices below
     loss_type: str = "triplet"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
@@ -126,13 +151,13 @@ class Config:
     kd_weight_list: float = 0.0  # not used yet (stub)
 
     # optimization
-    epochs: int = 2
+    epochs: int = 80
     lr: float = 0.00008468008575248323
     wd: float = 0.006351221010640704 #1e-4
     momentum: float = 0.9
     warmup_t: int = 5
-    lr_min: float = 1e-6
-    optimizer_name: str = "sgd"  # sgd | adam
+    lr_min: Optional[float] = None
+    optimizer_name: str = "sgd"  # sgd | adam | adamw
 
     tune_trials: int = 0  # 0 = no tuning; >0 runs optuna
     tune_direction: str = "maximize"  # "maximize" mAP
@@ -141,6 +166,7 @@ class Config:
     tune_pruner: str = "hyperband"  # median | sha | hyperband | none
     tune_sampler: str = "tpe"  # currently only tpe wired
     tune_seed: int = 42
+    tune_min_epochs: int = 1
 
     # training loop
     accumulation_steps: int = 1
@@ -231,25 +257,13 @@ def remove_curvature_from_optimizer(optimizer, manifold) -> None:
 def suggest_params(trial: "optuna.trial.Trial", cfg: Config) -> Dict[str, object]:
     if cfg.hyperbolic:
         params = {
-            # "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
-            "lr": trial.suggest_categorical("lr", [0.1, 0.01, 0.001, 0.0005, 0.0001, 0.00005, 0.00001, 0.000001]),
-            # "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
-            "epochs": trial.suggest_int("epochs", 30, 100, step=10),
-            # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
-            # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
-            # "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
-            # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
+            "lr": trial.suggest_float("lr", 1e-5, 3e-3, log=True),
+            "wd": trial.suggest_float("wd", 1e-4, 1e-2, log=True),
         }
     else:
         params = {
-            # "lr": trial.suggest_float("lr", 1e-2, 3e-3, log=True),
-            "lr": trial.suggest_categorical("lr", [0.1, 0.01, 0.001, 0.0001, 0.00001]),
-            # "wd": trial.suggest_float("wd", 1e-6, 1e-2, log=True),
-            "epochs": trial.suggest_int("epochs", 30, 100, step=10),
-            # "use_xbm": trial.suggest_categorical("use_xbm", [True, False]),
-            # "train_batch": trial.suggest_categorical("train_batch", [64, 96, 128, 160]),
-            # "optimizer_name": trial.suggest_categorical("optimizer_name", ["sgd", "adam"]),
-            # "type_of_triplets": trial.suggest_categorical("type_of_triplets", ["semihard", "all", "hard"]),
+            "lr": trial.suggest_float("lr", 1e-4, 3e-2, log=True),
+            "wd": trial.suggest_float("wd", 1e-4, 1e-2, log=True),
         }
     return params
 
@@ -343,17 +357,17 @@ class ModelBuilder:
                     else:
                         torch.nn.init.zeros_(p)
 
-        if self.model_name == "hyp_swin":
+        if self.model_name == "hyp_swin_fix":
             if self.pretrained:
                 raise ValueError("hyp_swin does not support pretrained=True")
             manifold = Lorentz()
             lock_curvature_to_one(manifold)
             if self.ViT_size == "base":
-                backbone = LSwin_base(manifold, manifold, manifold, num_classes=0, embed_dim=48 + 1)
+                backbone = LSwin_base(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             elif self.ViT_size == "small":
-                backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
+                backbone = LSwin_small(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             elif self.ViT_size == "tiny":
-                backbone = LSwin_tiny(manifold, manifold, manifold, num_classes=0, embed_dim=32 + 1)
+                backbone = LSwin_tiny(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             else:
                 raise ValueError(f"Unsupported ViT_size {self.ViT_size} for hyperbolic swin")
             for p in backbone.parameters():
@@ -421,23 +435,28 @@ class ModelBuilder:
             # NOTE: This model manages its own freezing, so we return early
             return backbone, emb_dim, manifold
         elif self.model_name == "ViT":
-            backbone = timm.create_model(
-                f"vit_{self.ViT_size}_patch16_224", num_classes=0, pretrained=self.pretrained
-            )
-            emb_dim = backbone.num_features
-            if not self.pretrained:
-                backbone.apply(init_weights_xavier)
+
+            if self.ViT_size == "base":
+                backbone = vit_b_16(num_classes=0, embed_dim=self.cfg.output_embed_dim)
+            elif self.ViT_size == "small":
+                backbone = vit_s_16(num_classes=0, embed_dim=self.cfg.output_embed_dim)
+            elif self.ViT_size == "tiny":
+                backbone = vit_t_16(num_classes=0, embed_dim=self.cfg.output_embed_dim)
+            else:
+                raise ValueError(f"Unsupported ViT_size {self.ViT_size} for ViT")
+            emb_dim = backbone.embed_dim
+
         elif self.model_name == "LViT":
             if self.pretrained:
                 raise ValueError("LViT does not support pretrained=True")
             manifold = Lorentz()
             lock_curvature_to_one(manifold)
             if self.ViT_size == "base":
-                backbone = LViT_base(manifold, manifold, manifold, num_classes=0)
+                backbone = LViT_base(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             elif self.ViT_size == "small":
-                backbone = LViT_small(manifold, manifold, manifold, num_classes=0)
+                backbone = LViT_small(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             elif self.ViT_size == "tiny":
-                backbone = LViT_tiny(manifold, manifold, manifold, num_classes=0)
+                backbone = LViT_tiny(manifold, manifold, manifold, num_classes=0, embed_dim=self.cfg.output_embed_dim)
             else:
                 raise ValueError(f"Unsupported ViT_size {self.ViT_size} for LViT")
             for p in backbone.parameters():
@@ -509,6 +528,16 @@ class OptimBuilder:
                     optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
                 if manifold is not None:
                     remove_curvature_from_optimizer(optimizer, manifold)
+            elif self.cfg.optimizer_name == "adamw":
+                optimizer = RiemannianAdamW(
+                    [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}],
+                    lr=self.cfg.lr,
+                    stabilize=1,
+                )
+                if self.cfg.loss_type != "triplet":
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+                if manifold is not None:
+                    remove_curvature_from_optimizer(optimizer, manifold)
             else:
                 optimizer = RiemannianSGD(
                     [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}],
@@ -523,6 +552,13 @@ class OptimBuilder:
         else:
             if self.cfg.optimizer_name == "adam":
                 optimizer = torch.optim.Adam(
+                    [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}],
+                    lr=self.cfg.lr,
+                )
+                if self.cfg.loss_type != "triplet":
+                    optimizer.add_param_group({"params": head_params, "weight_decay": 0.0})
+            elif self.cfg.optimizer_name == "adamw":
+                optimizer = torch.optim.AdamW(
                     [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}],
                     lr=self.cfg.lr,
                 )
@@ -543,11 +579,12 @@ class OptimBuilder:
         
         scheduler = None
         if self.use_scheduler:
+            lr_min = self.cfg.lr * 0.01 if self.cfg.lr_min is None else self.cfg.lr_min
             scheduler = CosineLRScheduler(
                 optimizer,
                 t_initial=self.cfg.epochs,
-                lr_min=self.cfg.lr_min,
-                warmup_lr_init=self.cfg.lr_min,
+                lr_min=lr_min,
+                warmup_lr_init=0.0,
                 warmup_t=self.cfg.warmup_t,
                 cycle_limit=1,
                 t_in_epochs=True,
@@ -956,6 +993,7 @@ def _parse_args() -> Config:
     p.add_argument("--tune-pruner", type=str, default=Config.tune_pruner, choices=["median", "sha", "hyperband", "none"])
     p.add_argument("--tune-sampler", type=str, default=Config.tune_sampler, choices=["tpe"])
     p.add_argument("--tune-seed", type=int, default=Config.tune_seed)
+    p.add_argument("--tune-min-epochs", type=int, default=Config.tune_min_epochs, help="Minimum epochs (min_resource) for Hyperband / resource-based pruners")
 
     p.add_argument("--kd-enable", action="store_true", default=Config.kd_enable)
     p.add_argument("--kd-weight-pkt", type=float, default=Config.kd_weight_pkt)
@@ -965,6 +1003,7 @@ def _parse_args() -> Config:
     # optional stubs for later:
     p.add_argument("--kd-weight-rkd", type=float, default=Config.kd_weight_rkd)
     p.add_argument("--kd-weight-list", type=float, default=Config.kd_weight_list)
+    p.add_argument("--output-embed-dim", type=int, default=Config.output_embed_dim)
 
     args = p.parse_args()
     cfg = Config(
@@ -1009,6 +1048,8 @@ def _parse_args() -> Config:
         use_scheduler=args.use_scheduler,
         use_xbm=args.use_xbm,
         type_of_triplets=args.type_of_triplets,
+        tune_min_epochs=args.tune_min_epochs,
+        output_embed_dim=args.output_embed_dim,
     )
     return cfg
 
@@ -1019,7 +1060,19 @@ def _run_one_trial(trial: "optuna.trial.Trial", base_cfg: Config):
     suggested = suggest_params(trial, cfg)
 
     def _coerce(val, target):
-        return bool(val) if isinstance(target, bool) else type(target)(val)
+        # If the target is a bool, cast to bool.
+        if isinstance(target, bool):
+            return bool(val)
+        # If the existing attribute value is None (Optional fields), don't attempt to
+        # call type(None); just return the suggested value as-is.
+        if target is None:
+            return val
+        # Otherwise try to coerce to the type of the existing attribute; on failure
+        # fall back to returning the suggested value unchanged.
+        try:
+            return type(target)(val)
+        except Exception:
+            return val
 
     for k, v in suggested.items():
         if hasattr(cfg, k):
@@ -1098,7 +1151,19 @@ def run_optuna(cfg: Config):
         "hyperband": HyperbandPruner(),
         "none": None,
     }
-    pruner = pruner_map[cfg.tune_pruner]
+    # pruner = pruner_map[cfg.tune_pruner]
+    if cfg.tune_pruner == "median":
+        pruner = MedianPruner(n_warmup_steps=3)
+    elif cfg.tune_pruner == "sha":
+        # SuccessiveHalvingPruner accepts min_resource in recent optuna versions; leave default if not needed
+        try:
+            pruner = SuccessiveHalvingPruner(min_resource=cfg.tune_min_epochs)
+        except TypeError:
+            pruner = SuccessiveHalvingPruner()
+    elif cfg.tune_pruner == "hyperband":
+        pruner = HyperbandPruner(min_resource=cfg.tune_min_epochs)
+    else:
+        pruner = None
 
     study = optuna.create_study(
         direction=cfg.tune_direction,
