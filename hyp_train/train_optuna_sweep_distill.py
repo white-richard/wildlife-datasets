@@ -9,15 +9,15 @@ sudo docker run -d --name optuna-pg \
   -e POSTGRES_PASSWORD=optuna-pg \
   -e POSTGRES_DB=wr10k \
   -v optuna_pgdata:/var/lib/postgresql/data \
-  -p 100.121.43.41:5432:5432 \
+  -p 100.113.213.2:5432:5432 \
   postgres:15
 
 python train_optuna_sweep_distill.py \
   --tune-trials -1 \
   --tune-direction maximize \
-  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.121.43.41:5432/wr10k \
-  --tune-study hyp_vs_euc \
-  --wandb online --project hyp_vs_euc \
+  --tune-storage postgresql+psycopg2://optuna:optuna-pg@100.113.213.2:5432/wr10k \
+  --tune-study wr10k_megadesc_lastLayer \
+  --wandb online --project reproduce_mega_descriptor \
   --tune-seed 42
 
 
@@ -113,30 +113,29 @@ class Config:
     seed: int = 42
     save_dir: str = "checkpoints"
 
-    dataset_name: str = "ATRW"  # wildlife10k | lynx | ATRW
+    dataset_name: str = "lynx"  # wildlife10k | lynx | ATRW
 
     # data
     root: str = "../../../datasets/wildlifereid-10k"
 
     img_size: int = 224
     num_workers: int = 8
-    train_batch: int = 32
+    train_batch: int = 96
     eval_batch: int = 64
     aug_policy: str = "randaug"  # baseline | weak | strong | randaug | augmix
-    calculate_mean_std: bool = True
+    calculate_mean_std: bool = False
     data_mean: Tuple[float, float, float] = None #(0.485, 0.456, 0.406)
     data_std: Tuple[float, float, float] = None #(0.229, 0.224, 0.225)
 
     # model / paradigm
-    model_name: str = "ViT" # megadescriptor_replace_last_layer_hyp | ViT | LViT  # choices below
-    ViT_size: str = "small"  # base | small | tiny
-    output_embed_dim: Optional[int] = None  # None = use default embedding dim
+    model_name: str = "megadescriptor_replace_last_layer_hyp" # megadescriptor_replace_last_layer_hyp | ViT | LViT  # choices below
+    ViT_size: str = "tiny"  # base | small | tiny
     teacher_name: str = "megadescriptor"  # choices below
     loss_type: str = "triplet"  # arcface | triplet
     use_xbm: bool = False  # for triplet loss
     type_of_triplets: str = "semihard"  # all | hard | semihard | easy | None
-    hyperbolic: bool = False
-    freeze_backbone: bool = False  # freeze backbone weights
+    hyperbolic: bool = True
+    freeze_backbone: bool = False  # freeze backbone weights, train last layer only
     pretrained: bool = False  # use pretrained weights where applicable
 
     # --- KD / Distillation ---
@@ -151,11 +150,13 @@ class Config:
     kd_weight_list: float = 0.0  # not used yet (stub)
 
     # optimization
-    epochs: int = 80
-    lr: float = 0.00008468008575248323
+    epochs: int = 60
+    lr: float = 0.00008468008575248323 #0.001
     wd: float = 0.006351221010640704 #1e-4
     momentum: float = 0.9
     warmup_t: int = 5
+    lr_min: float = 1e-6
+    optimizer_name: str = "adam"  # sgd | adam
     lr_min: Optional[float] = None
     optimizer_name: str = "sgd"  # sgd | adam | adamw
 
@@ -177,7 +178,7 @@ class Config:
 
     # logging
     wandb_mode: WandbMode = WandbMode.OFF
-    project: str = "expr_hyp_vs_euc_reid"
+    project: str = "reproduce_mega_descriptor"
 
 
 def init_weights_xavier(m):
@@ -397,23 +398,28 @@ class ModelBuilder:
                 f"hf-hub:BVRA/MegaDescriptor-{ViT_size}-224", num_classes=0, pretrained=True
             )
             emb_dim = backbone.num_features
-            reinit_module(backbone.layers[-1])
-            # Freeze all parameters first
             for _, p in backbone.named_parameters():
                 p.requires_grad = False
+
+            reinit_module(backbone.layers[-1])
+            reinit_module(backbone.layers[-2])
+            
             # Unfreeze last layer - this handles the freeze_backbone logic internally
             for p in backbone.layers[-1].parameters():
                 p.requires_grad = True
+
+            for p in backbone.layers[-2].parameters():
+                p.requires_grad = True
+
             return backbone, emb_dim, manifold
             # NOTE: skip the self.freeze_backbone check at the end for this model
 
         elif self.model_name == "megadescriptor_replace_last_layer_hyp":
-            if self.ViT_size != "base":
-                raise ValueError("megadescriptor_replace_last_layer_hyp only supports ViT_size='base'")
             # if not self.pretrained:
             #     raise ValueError("megadescriptor_replace_last_layer_hyp only supports pretrained=True")
-            backbone = timm.create_model("hf-hub:BVRA/MegaDescriptor-B-224", num_classes=0, pretrained=True)
-            backbone, hyp_stages = replace_stages_with_hyperbolic(backbone, num_stages=1)
+        
+            backbone = timm.create_model(f"hf-hub:BVRA/MegaDescriptor-{self.ViT_size[0].upper()}-224", num_classes=0, pretrained=True)
+            backbone, hyp_stages = replace_stages_with_hyperbolic(backbone, num_stages=2)
             if hasattr(backbone, "norm"):
                 backbone.norm = nn.Identity()
             if hasattr(backbone, "global_pool"):
@@ -425,6 +431,14 @@ class ModelBuilder:
             for hyp_stage in hyp_stages:
                 for p in hyp_stage.parameters():
                     p.requires_grad = True
+            
+            # reinit_module(backbone.layers[-2])
+            # # unfreeze 2nd to layer layer
+            # for p in backbone.layers[-2].parameters():
+            #     p.requires_grad = True
+            # from warnings import warn
+            # warn("megadescriptor_replace_last_layer_hyp: freezing all but last two layers")
+
             backbone.eval()
             with torch.no_grad():
                 dummy = torch.zeros(1, 3, self.cfg.img_size, self.cfg.img_size)
@@ -1242,7 +1256,7 @@ def main():
                             )
                         }
                     )
-            checkpoint_path = "/home/richw/.code/repos/wildlife-datasets/hyp_train/best/solar-vortex-148_best_epoch73.pt"
+            checkpoint_path = "/home/richw/.code/repos/wildlife-datasets/hyp_train/bests/restful-oath-174_best_epoch36.pt"
             load_checkpoint(checkpoint_path, backbone)
             overall, per_dataset_acc = _eval_knn(backbone, loaders, device, hyperbolic=cfg.hyperbolic, manifold=manifold)
             print(f"Overall acc: {overall}.")

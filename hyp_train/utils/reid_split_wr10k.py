@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import Tuple, Set, Dict, Any
+import os
+
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
@@ -7,14 +9,6 @@ from torch.utils.data import DataLoader
 from wildlife_datasets.datasets import WildlifeReID10k, WildlifeDataset
 from wildlife_datasets import splits
 from .wr10k_dataset import WR10kDataset
-
-
-# Assumed available from your codebase:
-# - WildlifeReID10k
-# - WR10kDataset
-# - splits.ClosedSetSplit
-# - _train_tfms(), _eval_tfms()
-# - cfg with attributes: root, train_batch, eval_batch, num_workers, seed (optional)
 
 @dataclass
 class ReIDSplits:
@@ -155,7 +149,7 @@ def build_reid_pipeline(
 
     if cfg.dataset_name == "lynx":
         # For lynx dataset
-        import os
+        cfg.root = "../../../datasets/CzechLynx"
         metadata = pd.read_csv(os.path.join(cfg.root, "metadata.csv"))
         meta = WildlifeDataset(cfg.root, metadata) 
         df = _normalize_meta_df(meta.df, cfg.root)
