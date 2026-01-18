@@ -47,20 +47,22 @@ class WildlifeDataset:
     license_file_name = 'LICENSE_link'
 
     def __init__(
-            self, 
-            root: Optional[str] = None,
-            df: Optional[pd.DataFrame] = None,
-            update_wrong_labels: bool = True,
-            transform: Optional[Callable] = None,
-            img_load: str = "full",
-            remove_unknown: bool = False,
-            remove_columns: bool = False,
-            check_files: bool = True,
-            load_label: bool = False,
-            factorize_label: bool = False,
-            col_path: str = "path",
-            col_label: str = "identity",            
-            **kwargs) -> None:
+        self,
+        root: Optional[str] = None,
+        df: Optional[pd.DataFrame] = None,
+        update_wrong_labels: bool = True,
+        transform: Optional[Callable] = None,
+        img_load: str = "full",
+        remove_unknown: bool = False,
+        remove_columns: bool = False,
+        check_files: bool = True,
+        load_label: bool = False,
+        factorize_label: bool = False,
+        return_columns: Optional[Union[str, List[str]]] = None,
+        col_path: str = "path",
+        col_label: str = "identity",
+        **kwargs,
+    ) -> None:
         """Initializes the class.
 
         If `df` is specified, it copies it. Otherwise, it creates it
@@ -77,6 +79,7 @@ class WildlifeDataset:
             check_files (bool, optional): Whether files should be checks for existence in `finalize_catalogue`.
             load_label (bool, optional): Whether dataset[k] should return only image or also identity.
             factorize_label (bool, optional): Whether labels are returned factorized (intergers) or original (possibly strings).
+            return_columns (Optional[Union[str,List[str]]], optional): Column name or list of column names to return in `__getitem__` after image/label (e.g. 'orientation').
             col_path (str, optional): Column name containing image paths.
             col_label (str, optional): Column name containing individual animal names (labels).
         """
@@ -112,6 +115,18 @@ class WildlifeDataset:
         self.load_label = load_label
         self.factorize_label = factorize_label
         self.labels, self.labels_map = pd.factorize(self.df[self.col_label].to_numpy())
+
+        # Columns to return along with the image (and optionally label)
+        if isinstance(return_columns, str):
+            self.return_columns = [return_columns]
+        else:
+            self.return_columns = list(return_columns) if return_columns is not None else None
+
+        # Validate requested columns exist in the dataframe
+        if self.return_columns is not None:
+            missing = [c for c in self.return_columns if c not in self.df.columns]
+            if len(missing) > 0:
+                raise Exception(f"return_columns not found in dataframe: {missing}")
 
     @property
     def labels_string(self):
@@ -150,17 +165,28 @@ class WildlifeDataset:
             idx (int): Index of the image.
 
         Returns:
-            Loaded image.
+            If no label and no `return_columns` requested, returns the loaded image.
+            If `load_label` is True and/or `return_columns` is set, returns a tuple:
+                (image, [label?], [col1, col2, ...])
         """
 
         img = self.get_image(idx)
         img = self.apply_segmentation(img, idx)
-        if self.load_label and self.factorize_label:
-            return img, self.labels[idx]
-        elif self.load_label:
-            return img, self.df[self.col_label].iloc[idx]
+        outputs = [img]
+
+        if self.load_label:
+            if self.factorize_label:
+                outputs.append(self.labels[idx])
+            else:
+                outputs.append(self.df[self.col_label].iloc[idx])
+        if self.return_columns:
+            for col in self.return_columns:
+                outputs.append(self.df[col].iloc[idx])
+
+        if len(outputs) == 1:
+            return outputs[0]
         else:
-            return img
+            return tuple(outputs)
 
     def get_subset(self, idx: Union[List[int], List[bool]]) -> WildlifeDataset:
         """Returns a subset of the class.
